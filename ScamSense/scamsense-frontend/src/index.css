@@ -127,6 +127,12 @@ p {
   padding: 36px;
 }
 
+/* When Deepfake tool is active enlarge the card to provide a wider video area */
+.dashboard-card.deepfake-active {
+  max-width: 1220px;
+  padding: 42px;
+}
+
 .eyebrow {
   display: inline-block;
   margin-bottom: 10px;

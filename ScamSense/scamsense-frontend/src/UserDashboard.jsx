@@ -47,7 +47,7 @@ function UserDashboard() {
     <div className="page-shell dashboard-shell">
       <div className="bg-grid" aria-hidden="true" />
 
-      <main className="card dashboard-card reveal-up">
+      <main className={"card dashboard-card reveal-up" + (activeTool === "deepfake" ? " deepfake-active" : "")}>
         <header className="dashboard-head">
           <div>
             <p className="eyebrow">ScamSense</p>

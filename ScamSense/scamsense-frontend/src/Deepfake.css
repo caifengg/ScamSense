@@ -1,0 +1,179 @@
+/* Styles for the Deepfake video call UI (left panel only) */
+.deepfake-panel {
+  display: flex;
+  gap: 28px;
+  align-items: stretch;
+  padding: 10px 6px 24px 6px;
+  box-sizing: border-box;
+}
+
+.video-area {
+  position: relative;
+  flex: 1 1 72%;
+  min-height: 620px;
+  background: #0f1724;
+  border-radius: 12px;
+  overflow: hidden;
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.call-header {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  z-index: 10;
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  color: #cbd5e1;
+  font-weight: 600;
+}
+
+.call-dot {
+  width: 10px;
+  height: 10px;
+  background: #10b981;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.call-timer {
+  margin-left: 12px;
+  opacity: 0.8;
+  font-size: 13px;
+}
+
+.remote-video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  background: #0b1220;
+}
+
+.local-preview {
+  position: absolute;
+  right: 18px;
+  bottom: 84px;
+  width: 160px;
+  height: 120px;
+  background: rgba(0, 0, 0, 0.35);
+  border-radius: 8px;
+  overflow: hidden;
+  z-index: 12;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.local-video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.upload-area {
+  cursor: pointer;
+}
+
+.upload-hint {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: rgba(255, 255, 255, 0.7);
+  font-size: 13px;
+  padding: 8px;
+  text-align: center;
+}
+
+.participant-meta {
+  position: absolute;
+  left: 8px;
+  bottom: 6px;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.participant-name {
+  background: rgba(0, 0, 0, 0.45);
+  padding: 4px 8px;
+  border-radius: 6px;
+  font-size: 12px;
+  color: #fff;
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  background: #10b981;
+  border-radius: 50%;
+  box-shadow: 0 0 0 4px rgba(16, 185, 129, 0.12);
+}
+
+.local-preview.has-video {
+  background: transparent;
+}
+
+.controls {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  bottom: 16px;
+  z-index: 20;
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+
+.control-btn {
+  background: rgba(255, 255, 255, 0.06);
+  color: #e6eef8;
+  border: none;
+  padding: 10px 12px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.control-btn.primary {
+  background: #2563eb;
+}
+
+.control-btn.danger {
+  background: #ef4444;
+}
+
+.detection-panel {
+  width: 360px;
+  min-width: 300px;
+  background: transparent;
+  display: flex;
+  align-items: flex-start;
+}
+
+.detection-placeholder {
+  width: 100%;
+  background: linear-gradient(180deg, #0b1220, #0b1a2a);
+  padding: 18px;
+  border-radius: 12px;
+  color: #cbd5e1;
+}
+
+.muted {
+  color: #94a3b8;
+}
+
+@media (max-width: 900px) {
+  .deepfake-panel {
+    flex-direction: column;
+  }
+  .detection-panel {
+    width: 100%;
+    min-width: 0;
+  }
+}
