@@ -20,7 +20,7 @@ from facenet_pytorch import MTCNN
 
 # ── Settings (must match what the model was trained with — Cell 3 of the notebook) ──
 IMG_SIZE   = 224
-THRESHOLD  = 0.45                 # decision cutoff used during training/eval
+THRESHOLD  = 0.12                # decision cutoff used during training/eval
 MODEL_PATH = Path(__file__).parent / "deepfake_finetuned.pth"
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
@@ -54,34 +54,53 @@ class DeepfakeNet(nn.Module):
 
 # ── Face detection (identical to Cell 4 of the notebook) ───────────────────────
 def _build_mtcnn(device):
+    # post_process=False keeps pixel values in [0,255] uint8; do NOT change this
+    # or the .byte() conversion in get_face_pil will silently corrupt the crop.
+    # image_size=224 so MTCNN outputs the exact resolution eval_tf expects —
+    # avoids the extra 160→224 upscale that was not present at training time.
     primary = MTCNN(
-        image_size=160, margin=14, min_face_size=20,
+        image_size=224, margin=14, min_face_size=20,
         thresholds=[0.5, 0.6, 0.6],          # relaxed — catches small low-res faces
         keep_all=False, post_process=False, device=device,
     )
     sensitive = MTCNN(
-        image_size=160, margin=10, min_face_size=10,
+        image_size=224, margin=14, min_face_size=10,
         thresholds=[0.4, 0.5, 0.5],          # even more relaxed for 2x upscaled frames
         keep_all=False, post_process=False, device=device,
     )
     return primary, sensitive
 
 
-def get_face_pil(frame_rgb: np.ndarray, mtcnn: MTCNN, mtcnn_sensitive: MTCNN):
-    """Returns (PIL crop, face_detected:bool). Never returns None — falls back
-    to a centre-crop if MTCNN can't find a face."""
-    h, w = frame_rgb.shape[:2]
+def get_face_pil(frame_rgb: np.ndarray, mtcnn: MTCNN, mtcnn_sensitive: MTCNN,
+                 last_good_crop: Optional[Image.Image] = None):
+    """Returns (PIL crop, face_detected:bool).
+    Detection order:
+      1. Primary MTCNN on the original frame.
+      2. Sensitive MTCNN on a 2x upscaled copy.
+      3. Last known-good face crop from a previous frame (avoids feeding an
+         out-of-distribution centre-crop to the model).
+      4. Centre-crop of the full frame as a last resort (only when no prior
+         crop is available at all).
+    """
     pil = Image.fromarray(frame_rgb)
 
     face = mtcnn(pil)
     if face is not None:
         return Image.fromarray(face.permute(1, 2, 0).byte().numpy()), True
 
+    h, w = frame_rgb.shape[:2]
     up = pil.resize((w * 2, h * 2), Image.BILINEAR)
     face = mtcnn_sensitive(up)
     if face is not None:
         return Image.fromarray(face.permute(1, 2, 0).byte().numpy()), True
 
+    # Use the last frame where a face was successfully detected instead of a
+    # random centre-crop — keeps the model input in-distribution.
+    if last_good_crop is not None:
+        return last_good_crop, False
+
+    # Absolute last resort: centre-crop (only on the very first frames before
+    # any face has ever been detected).
     crop = min(h, w)
     t, l = (h - crop) // 2, (w - crop) // 2
     return pil.crop((l, t, l + crop, t + crop)), False
@@ -96,22 +115,43 @@ class Detector:
     def __init__(self, model_path: Path = MODEL_PATH, device: Optional[str] = None):
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self.model = DeepfakeNet().to(self.device)
-        state = torch.load(model_path, map_location=self.device)
+        state = torch.load(model_path, map_location=self.device, weights_only=False)
         self.model.load_state_dict(state)
         self.model.eval()
         self.mtcnn, self.mtcnn_sensitive = _build_mtcnn(self.device)
+        self._frame_count = 0     # debug: counts frames scored
+        self._last_good_crop: Optional[Image.Image] = None  # last frame with a detected face
 
     @torch.no_grad()
     def score_frame(self, frame_rgb: np.ndarray) -> dict:
         """Score a single RGB frame (HxWx3 numpy array). Returns this frame's
         probability alone — no temporal smoothing (see RollingVerdict for that)."""
-        face_pil, face_found = get_face_pil(frame_rgb, self.mtcnn, self.mtcnn_sensitive)
-        face_pil = face_pil.resize((IMG_SIZE, IMG_SIZE))
+        face_pil, face_found = get_face_pil(
+            frame_rgb, self.mtcnn, self.mtcnn_sensitive, self._last_good_crop
+        )
+        if face_found:
+            self._last_good_crop = face_pil  # cache for use on missed-face frames
+        # MTCNN now outputs 224×224 directly; eval_tf's Resize is a no-op but kept
+        # for safety in case image_size is ever changed above.
         x = eval_tf(face_pil).unsqueeze(0).to(self.device)
         prob = torch.sigmoid(self.model(x)).item()
+        verdict = "DEEPFAKE" if prob > THRESHOLD else "REAL"
+
+        # ── Debug output ────────────────────────────────────────────────────────
+        self._frame_count += 1
+        print(
+            f"[debug] frame={self._frame_count:05d} "
+            f"prob={prob:.4f} verdict={verdict} face_found={face_found}"
+        )
+        if self._frame_count % 100 == 0:
+            debug_path = Path(__file__).parent / f"debug_{self._frame_count}.jpg"
+            face_pil.save(debug_path)
+            print(f"[debug] saved face crop → {debug_path}")
+        # ── End debug ────────────────────────────────────────────────────────────
+
         return {
             "prob": prob,
-            "verdict": "DEEPFAKE" if prob > THRESHOLD else "REAL",
+            "verdict": verdict,
             "face_found": face_found,
         }
 

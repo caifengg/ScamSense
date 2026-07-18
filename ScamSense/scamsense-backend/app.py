@@ -1,15 +1,33 @@
+import base64
+import io
+
+import numpy as np
 from flask import Flask, request
 from joblib import load
 import pymysql
 from pathlib import Path
+from PIL import Image as PILImage
 
 from database import DB_CONNECTION_ERROR, connection, cursor
 from feature_extractor import extract_features
-from gemini_explainer import generate_explanation
+from gemini_explainer import generate_explanation, generate_deepfake_explanation
 
 MODEL_PATH = Path(__file__).resolve().with_name("phishing_model.pkl")
 model = load(MODEL_PATH)
 app = Flask(__name__)
+
+# ── Deepfake detector (lazy-loaded on first request) ────────────────────────────
+_deepfake_detector = None
+_deepfake_sessions: dict = {}
+_deepfake_reasons: dict = {}  # {session_id: {"verdict": str, "reason": str}}
+
+
+def _get_deepfake_detector():
+    global _deepfake_detector
+    if _deepfake_detector is None:
+        from jing_model import Detector  # heavy import — only once
+        _deepfake_detector = Detector()
+    return _deepfake_detector
 
 
 def ensure_db_ready():
@@ -184,6 +202,85 @@ def admin_stats():
         "total_users": total_users,
         "total_scams": total_scams,
     }
+
+
+@app.route("/deepfake/score", methods=["POST", "OPTIONS"])
+def deepfake_score():
+    if request.method == "OPTIONS":
+        return "", 204
+
+    data = request.get_json(silent=True) or {}
+    frame_b64 = data.get("frame")
+    session_id = data.get("session_id", "default")
+    reset = data.get("reset", False)
+
+    if not frame_b64:
+        return {"error": "No frame provided"}, 400
+
+    try:
+        img_bytes = base64.b64decode(frame_b64)
+        img = PILImage.open(io.BytesIO(img_bytes)).convert("RGB")
+        frame_rgb = np.array(img)
+    except Exception as exc:
+        return {"error": f"Invalid frame data: {exc}"}, 400
+
+    try:
+        detector = _get_deepfake_detector()
+    except Exception as exc:
+        return {"error": f"Model unavailable: {exc}"}, 503
+
+    try:
+        frame_result = detector.score_frame(frame_rgb)
+    except Exception as exc:
+        return {"error": f"Frame scoring failed: {exc}"}, 500
+
+    from jing_model import RollingVerdict
+    if reset or session_id not in _deepfake_sessions:
+        _deepfake_sessions[session_id] = RollingVerdict(window=25)
+
+    rolling = _deepfake_sessions[session_id].update(
+        frame_result["prob"], frame_result["face_found"]
+    )
+
+    # ── Debug logging ────────────────────────────────────────────────────────────
+    print(
+        f"[score] frame_prob={frame_result['prob']:.4f} frame_verdict={frame_result['verdict']}"
+        f" | rolling_prob={rolling['prob']:.4f} rolling_verdict={rolling['verdict']}"
+        f" | frames_in_window={rolling['frames_in_window']}"
+    )
+    # ── End debug ────────────────────────────────────────────────────────────────
+
+    # ── LLM explanation (generated only when the verdict changes) ────────────────
+    current_verdict = rolling["verdict"]
+    cached = _deepfake_reasons.get(session_id)
+    if cached is None or cached["verdict"] != current_verdict:
+        reason = generate_deepfake_explanation(
+            verdict=current_verdict,
+            prob=rolling["prob"],
+            face_found=frame_result["face_found"],
+            frames_in_window=rolling["frames_in_window"],
+        )
+        _deepfake_reasons[session_id] = {"verdict": current_verdict, "reason": reason}
+    else:
+        reason = cached["reason"]
+    # ── End LLM explanation ───────────────────────────────────────────────────────
+
+    return {
+        "frame": frame_result,
+        "rolling": rolling,
+        "reason": reason,
+    }
+
+
+@app.route("/deepfake/reset", methods=["POST", "OPTIONS"])
+def deepfake_reset():
+    if request.method == "OPTIONS":
+        return "", 204
+    data = request.get_json(silent=True) or {}
+    session_id = data.get("session_id", "default")
+    _deepfake_sessions.pop(session_id, None)
+    _deepfake_reasons.pop(session_id, None)
+    return {"message": "session reset"}
 
 
 if __name__ == "__main__":
