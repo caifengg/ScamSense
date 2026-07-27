@@ -192,6 +192,41 @@ select:focus {
   box-shadow: 0 0 0 3px rgba(47, 158, 149, 0.15);
 }
 
+/* Added for the Text Extractor tool (SMS/message input) - no other tab
+   uses a <textarea>, since Phishing's URL field and Deepfake's controls
+   are all single-line/button based. Styled to match the existing
+   input/select rules above (same border, radius, focus glow) so it reads
+   as part of the same design system rather than a bolted-on element. */
+textarea {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: #fff;
+  padding: 12px 14px;
+  color: var(--ink);
+  outline: none;
+  font: inherit;
+  resize: vertical;   /* lets users expand the box for longer messages */
+  min-height: 120px;  /* tall enough to show several lines without scrolling */
+  transition: box-shadow 0.25s ease, border-color 0.25s ease;
+}
+
+textarea:focus {
+  border-color: var(--accent-2);
+  box-shadow: 0 0 0 3px rgba(47, 158, 149, 0.15);
+}
+
+/* Right-aligns the "Check Message" button under the textarea - Phishing's
+   equivalent button sits inline next to its input via .detector-row's grid
+   layout, but a multi-line textarea doesn't have a sensible "beside it"
+   position for a button, so it goes on its own row underneath instead. */
+.text-detector-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 12px;
+  margin-bottom: 16px;
+}
+
 button {
   border: none;
   border-radius: 12px;
@@ -331,6 +366,38 @@ button:disabled {
   font-size: 13px;
   font-weight: 400;
   opacity: 0.75;
+}
+
+/* Text Extractor only - shown between the result pill and the AI
+   explanation box whenever the backend detected non-English input and
+   translated it (see the `translated` prop in TextExtractor.jsx). Reuses
+   the exact box shape/padding/radius as .ai-explanation just below for
+   visual consistency, but intentionally uses --accent (orange) instead of
+   --accent-2 (teal) so a "here's the translation" box reads as distinct
+   from a "here's why" box, even though they're stacked directly on top of
+   each other. */
+.translation-box {
+  margin-top: 12px;
+  border-radius: 14px;
+  padding: 16px;
+  background: rgba(217, 93, 57, 0.08);
+  border: 1px solid rgba(217, 93, 57, 0.25);
+}
+
+.translation-label {
+  font-family: "Space Grotesk", "Segoe UI", sans-serif;
+  font-size: 13px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--accent);
+  margin-bottom: 6px;
+}
+
+.translation-box p:last-child {
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--ink);
 }
 
 .ai-explanation {
