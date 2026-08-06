@@ -341,6 +341,7 @@ def deepfake_score():
     if request.method == "OPTIONS":
         return "", 204
 
+#Read JSON data from the request
     data = request.get_json(silent=True) or {}
     frame_b64 = data.get("frame")
     session_id = data.get("session_id", "default")
@@ -391,6 +392,11 @@ def deepfake_score():
             prob=rolling["prob"],
             face_found=frame_result["face_found"],
             frames_in_window=rolling["frames_in_window"],
+            frame_prob=frame_result["prob"],
+            max_prob=rolling["max_prob"],
+            min_prob=rolling["min_prob"],
+            deepfake_frames=rolling["deepfake_frames"],
+            real_frames=rolling["real_frames"],
         )
         _deepfake_reasons[session_id] = {"verdict": current_verdict, "reason": reason}
     else:

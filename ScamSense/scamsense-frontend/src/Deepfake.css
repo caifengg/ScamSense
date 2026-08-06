@@ -303,18 +303,19 @@
   border: 1px solid rgba(255, 255, 255, 0.07);
 }
 
-.ai-explanation-title {
+/* Explicitly targeted to avoid conflicting with external p:last-child selectors */
+.ai-explanation .ai-explanation-title {
   font-size: 11px;
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.08em;
-  color: #64748b;
+  color: #ffffff;
 }
 
-.ai-explanation-text {
+.ai-explanation .ai-explanation-text {
   font-size: 12px;
   line-height: 1.6;
-  color: #94a3b8;
+  color: #ffffff !important; /* Forces text color to white over structural p overrides */
   margin: 0;
 }
 

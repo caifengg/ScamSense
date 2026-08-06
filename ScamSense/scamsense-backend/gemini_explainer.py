@@ -106,8 +106,15 @@ def generate_explanation(url: str, result: str, confidence=None) -> dict:
 
 # ── Deepfake explanation ──────────────────────────────────────────────────────
 
-def _build_deepfake_prompt(verdict: str, prob: float, face_found: bool, frames_in_window: int) -> str:
-    confidence_pct = f"{prob * 100:.1f}%"
+def _build_deepfake_prompt(
+    verdict: str, prob: float, face_found: bool, frames_in_window: int,
+    frame_prob: float, max_prob: float, min_prob: float,
+    deepfake_frames: int, real_frames: int,
+) -> str:
+    avg_pct       = f"{prob * 100:.1f}%"
+    frame_pct     = f"{frame_prob * 100:.1f}%"
+    max_pct       = f"{max_prob * 100:.1f}%"
+    min_pct       = f"{min_prob * 100:.1f}%"
     face_line = (
         "A face was clearly detected and analysed in the video."
         if face_found else
@@ -115,21 +122,29 @@ def _build_deepfake_prompt(verdict: str, prob: float, face_found: bool, frames_i
     )
     return f"""You are a safety assistant inside a deepfake-detection app called ScamSense, aimed at everyday Singaporean users.
 
-A machine learning model just analysed a live video call and produced this result:
-- Verdict: {verdict}
-- Deepfake likelihood: {confidence_pct}
-- {face_line}
-- Number of recent frames analysed: {frames_in_window}
+A deepfake detector analysed a live video call. Below are the real statistics from the detector — use only these facts to explain the result. Do NOT invent observations such as "unnatural eyes" or "strange mouth movements".
 
-Write a short explanation (2–3 sentences) in plain, non-technical language for a general user.
-If the verdict is DEEPFAKE, explain what it means and give one concrete safety tip (for example: hang up and re-verify the caller through a different channel such as a phone call or in person).
+Detector statistics:
+- Overall verdict: {verdict}
+- Frames analysed in current window: {frames_in_window}
+- Frames classified as DEEPFAKE: {deepfake_frames}
+- Frames classified as REAL: {real_frames}
+- Weighted average deepfake likelihood across the window: {avg_pct}
+- Highest single-frame deepfake likelihood: {max_pct}
+- Lowest single-frame deepfake likelihood: {min_pct}
+- Most recent single frame deepfake likelihood: {frame_pct}
+- {face_line}
+
+Write 2–3 sentences in plain, non-technical language for a general user that explain the verdict using only the statistics above.
+If the verdict is DEEPFAKE, give one concrete safety tip (e.g. hang up and verify the caller through a different channel).
 If the verdict is REAL, briefly reassure the user but remind them to stay alert.
-Do not use technical jargon such as "model", "tensor", "classifier", or "probability".
-Do not repeat the raw numbers verbatim — describe them naturally."""
+Do not use technical jargon. Do not invent visual observations not supported by the statistics."""
 
 
 def generate_deepfake_explanation(
-    verdict: str, prob: float, face_found: bool, frames_in_window: int
+    verdict: str, prob: float, face_found: bool, frames_in_window: int,
+    frame_prob: float = 0.0, max_prob: float = 0.0, min_prob: float = 0.0,
+    deepfake_frames: int = 0, real_frames: int = 0,
 ) -> str:
     """Return a human-readable explanation string for the current deepfake
     verdict.  Returns an empty string silently if the API is unavailable so
@@ -137,7 +152,11 @@ def generate_deepfake_explanation(
     if not GEMINI_API_KEY:
         return ""
 
-    prompt = _build_deepfake_prompt(verdict, prob, face_found, frames_in_window)
+    prompt = _build_deepfake_prompt(
+        verdict=verdict, prob=prob, face_found=face_found, frames_in_window=frames_in_window,
+        frame_prob=frame_prob, max_prob=max_prob, min_prob=min_prob,
+        deepfake_frames=deepfake_frames, real_frames=real_frames,
+    )
     payload = {"contents": [{"parts": [{"text": prompt}]}]}
     headers = {"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY}
 

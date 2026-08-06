@@ -170,8 +170,15 @@ class RollingVerdict:
         self.probs.append(prob)
         self.weights.append(3.0 if face_found else 1.0)
         mean_score = sum(p * w for p, w in zip(self.probs, self.weights)) / sum(self.weights)
+        probs_list = list(self.probs)
+        deepfake_frames = sum(1 for p in probs_list if p > THRESHOLD)
         return {
             "prob": mean_score,
             "verdict": "DEEPFAKE" if mean_score > THRESHOLD else "REAL",
-            "frames_in_window": len(self.probs),
+            "frames_in_window": len(probs_list),
+            # Extra statistics used only for LLM explanation — do not affect verdict
+            "max_prob": max(probs_list),
+            "min_prob": min(probs_list),
+            "deepfake_frames": deepfake_frames,
+            "real_frames": len(probs_list) - deepfake_frames,
         }
