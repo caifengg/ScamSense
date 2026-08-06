@@ -3,6 +3,50 @@ import "./Deepfake.css";
 
 const BACKEND = "http://localhost:5000";
 
+// ── Call status constants ─────────────────────────────────────────────────────
+const STATUS = {
+	READY: "ready",
+	CONNECTING: "connecting",
+	ACTIVE: "active",
+	ANALYSING: "analysing",
+	ENDED: "ended",
+	ERROR: "error",
+};
+
+// ── CallStatus sub-component ──────────────────────────────────────────────────
+function CallStatus({ status, elapsedTime, errorMessage }) {
+	const fmt = (s) =>
+		`${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
+
+	const dotMod = {
+		[STATUS.READY]: "grey",
+		[STATUS.CONNECTING]: "yellow",
+		[STATUS.ACTIVE]: "green",
+		[STATUS.ANALYSING]: "green",
+		[STATUS.ENDED]: "grey",
+		[STATUS.ERROR]: "red",
+	}[status] ?? "grey";
+
+	const label = {
+		[STATUS.READY]: "Ready to start",
+		[STATUS.CONNECTING]: "Connecting...",
+		[STATUS.ACTIVE]: "Call active",
+		[STATUS.ANALYSING]: "Analysing video...",
+		[STATUS.ENDED]: "Call ended",
+		[STATUS.ERROR]: errorMessage || "Connection error",
+	}[status];
+
+	return (
+		<div className="call-header">
+			<span className={`call-dot call-dot--${dotMod}`} />
+			<span className="call-status-label">{label}</span>
+			{status === STATUS.CONNECTING && <span className="header-spinner" />}
+			<span className="call-timer">{fmt(elapsedTime)}</span>
+		</div>
+	);
+}
+
+// ── Main component ────────────────────────────────────────────────────────────
 function Deepfake() {
 	const remoteVideoRef = useRef(null);
 	const localVideoRef = useRef(null);
@@ -17,18 +61,29 @@ function Deepfake() {
 	const mediaStreamRef = useRef(null);
 	const selectedCameraIdRef = useRef("");
 	const inCallRef = useRef(false);
+
+	// ── Call state ─────────────────────────────────────────────────────────────────────────
+	const [callStatus, setCallStatus] = useState(STATUS.READY);
+	const [elapsedTime, setElapsedTime] = useState(0);
+	const [errorMessage, setErrorMessage] = useState(null);
 	const [audioEnabled, setAudioEnabled] = useState(true);
 	const [videoEnabled, setVideoEnabled] = useState(true);
-	const [inCall, setInCall] = useState(false);
 	const [uploadedVideoURL, setUploadedVideoURL] = useState(null);
 	const [participantName] = useState("Alex Chen");
 	const [detectionResult, setDetectionResult] = useState(null);
-	const [isAnalyzing, setIsAnalyzing] = useState(false);
 	const [backendError, setBackendError] = useState(null);
 	const [cameras, setCameras] = useState([]);
 	const [selectedCameraId, setSelectedCameraId] = useState("");
 	const [showSettings, setShowSettings] = useState(false);
 	const [cameraError, setCameraError] = useState(null);
+
+	// Derived: call is live when ACTIVE or ANALYSING
+	const inCall = callStatus === STATUS.ACTIVE || callStatus === STATUS.ANALYSING;
+
+	// Keep inCallRef in sync for use inside async closures
+	useEffect(() => {
+		inCallRef.current = inCall;
+	}, [inCall]);
 
 	useEffect(() => {
 		// Enumerate cameras on mount without requesting media access.
@@ -54,7 +109,14 @@ function Deepfake() {
 		};
 	}, [uploadedVideoURL]);
 
-	// Start / stop live webcam analysis whenever the call state changes
+	// ── Call timer ─────────────────────────────────────────────────────────────────────────
+	useEffect(() => {
+		if (!inCall) return;
+		const timer = setInterval(() => setElapsedTime((t) => t + 1), 1000);
+		return () => clearInterval(timer);
+	}, [inCall]);
+
+	// ── Analysis loop: starts/stops with inCall ────────────────────────────────────────
 	useEffect(() => {
 		if (analyzeIntervalRef.current) {
 			clearInterval(analyzeIntervalRef.current);
@@ -62,8 +124,7 @@ function Deepfake() {
 		}
 
 		if (!inCall) {
-			setDetectionResult(null);
-			setIsAnalyzing(false);
+			// Keep detectionResult alive so ENDED state can still show last results
 			setBackendError(null);
 			return;
 		}
@@ -75,7 +136,6 @@ function Deepfake() {
 			body: JSON.stringify({ session_id: sessionIdRef.current }),
 		}).catch(() => {});
 		setDetectionResult(null);
-		setIsAnalyzing(false);
 		setBackendError(null);
 
 		let isMounted = true;
@@ -88,10 +148,8 @@ function Deepfake() {
 			analyzeIntervalRef.current = setInterval(async () => {
 				const videoEl = remoteVideoRef.current;
 				const canvas = canvasRef.current;
-				// Only skip if there is genuinely no frame yet
 				if (!videoEl || !canvas || videoEl.videoWidth === 0) return;
 
-				// Abort previous in-flight request before sending the next
 				if (currentAbort) currentAbort.abort();
 				currentAbort = new AbortController();
 
@@ -114,7 +172,10 @@ function Deepfake() {
 						const data = await res.json();
 						if (isMounted) {
 							setDetectionResult(data);
-							setIsAnalyzing(true);
+							// Transition ACTIVE → ANALYSING on first result
+							setCallStatus((prev) =>
+								prev === STATUS.ACTIVE ? STATUS.ANALYSING : prev
+							);
 							setBackendError(null);
 						}
 					} else {
@@ -129,7 +190,9 @@ function Deepfake() {
 					}
 				} catch (err) {
 					if (err.name !== "AbortError" && isMounted)
-						setBackendError("Cannot connect to detection backend — is the Flask server running on port 5000?");
+						setBackendError(
+							"Cannot connect to detection backend — is the Flask server running on port 5000?"
+						);
 				}
 			}, 1000);
 		}, 2000); // 2 s warm-up before first capture
@@ -218,6 +281,11 @@ function Deepfake() {
 	}
 
 	async function startCall() {
+		setCallStatus(STATUS.CONNECTING);
+		setErrorMessage(null);
+		setElapsedTime(0);
+		setDetectionResult(null);
+
 		try {
 			const camConstraint = selectedCameraIdRef.current
 				? { deviceId: { exact: selectedCameraIdRef.current }, width: 1280, height: 720 }
@@ -243,17 +311,21 @@ function Deepfake() {
 
 			// show local user in the large video area; small preview is reserved for uploaded remote video
 			if (remoteVideoRef.current) remoteVideoRef.current.srcObject = stream;
-			if (localVideoRef.current && !uploadedVideoURL) {
-				// keep small preview blank/upload placeholder until user provides a video
-				localVideoRef.current.srcObject = null;
-			}
-			inCallRef.current = true;
-			setInCall(true);
 			setAudioEnabled(true);
 			setVideoEnabled(true);
+			setCallStatus(STATUS.ACTIVE);
 		} catch (err) {
 			console.error("Could not get user media", err);
-			alert("Unable to access camera/microphone.");
+			let msg = "Failed to connect.";
+			if (err.name === "NotAllowedError") {
+				msg = "Camera or microphone permission denied. Please allow access in your browser settings and try again.";
+			} else if (err.name === "NotFoundError") {
+				msg = "No camera or microphone found on this device.";
+			} else if (err.name === "NotReadableError") {
+				msg = "Camera or microphone is already in use by another application.";
+			}
+			setErrorMessage(msg);
+			setCallStatus(STATUS.ERROR);
 		}
 	}
 
@@ -263,13 +335,12 @@ function Deepfake() {
 			mediaStreamRef.current = null;
 		}
 		if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
-		if (localVideoRef.current) {
-			// keep uploaded video if present; otherwise clear preview
-			if (!uploadedVideoURL) localVideoRef.current.srcObject = null;
-		}
-		inCallRef.current = false;
-		setInCall(false);
 		setShowSettings(false);
+		setCallStatus(STATUS.ENDED);
+	}
+
+	function retryCall() {
+		startCall();
 	}
 
 	function toggleAudio() {
@@ -310,13 +381,97 @@ function Deepfake() {
 		e.target.value = "";
 	}
 
+	// \u2500\u2500 Detection panel content ──────────────────────────────────────────────────
+	function renderResults() {
+		if (!detectionResult) return null;
+		return (
+			<div className="detection-results">
+				<div
+					className={`verdict-badge ${detectionResult.rolling.verdict === "DEEPFAKE" ? "deepfake" : "real"}`}
+				>
+					{detectionResult.rolling.verdict}
+				</div>
+
+				<div className="ai-explanation">
+					<span className="ai-explanation-title">AI Explanation</span>
+					<p className="ai-explanation-text">
+						{detectionResult.reason || "Analysing recent frames…"}
+					</p>
+				</div>
+
+				<div className="confidence-label">
+					<span>Deepfake probability</span>
+					<span className="confidence-pct">
+						{(detectionResult.rolling.prob * 100).toFixed(1)}%
+					</span>
+				</div>
+				<div className="confidence-track">
+					<div
+						className={`confidence-fill ${detectionResult.rolling.verdict === "DEEPFAKE" ? "deepfake" : "real"}`}
+						style={{ width: `${(detectionResult.rolling.prob * 100).toFixed(1)}%` }}
+					/>
+				</div>
+
+				<div className="detail-grid">
+					<span className="detail-key">Frames in window</span>
+					<span className="detail-val">{detectionResult.rolling.frames_in_window}</span>
+
+					<span className="detail-key">Face detected</span>
+					<span className={`detail-val ${detectionResult.frame.face_found ? "face-yes" : "face-no"}`}>
+						{detectionResult.frame.face_found ? "Yes" : "No — position face in frame"}
+					</span>
+
+					<span className="detail-key">Frame score</span>
+					<span className="detail-val">
+						{(detectionResult.frame.prob * 100).toFixed(1)}%
+					</span>
+				</div>
+
+				{!detectionResult.frame.face_found && (
+					<p className="face-warning">⚠ No face detected. Results may be less accurate.</p>
+				)}
+			</div>
+		);
+	}
+
+	function renderDetectionContent() {
+		if (callStatus === STATUS.READY || callStatus === STATUS.CONNECTING) {
+			return <p className="detection-idle">Start a call to begin live analysis.</p>;
+		}
+		if (callStatus === STATUS.ERROR) {
+			return <p className="detection-idle">{errorMessage || "Connection failed."}</p>;
+		}
+		if (callStatus === STATUS.ENDED) {
+			return (
+				<>
+					<p className="detection-ended-msg">Call ended. View the final analysis below.</p>
+					{renderResults()}
+				</>
+			);
+		}
+		if (backendError) {
+			return <p className="detection-error">{backendError}</p>;
+		}
+		if (callStatus === STATUS.ACTIVE) {
+			return (
+				<div className="detection-loading">
+					<span className="detection-spinner" />
+					<p className="detection-idle analyzing-pulse">Live deepfake analysis in progress</p>
+				</div>
+			);
+		}
+		// ANALYSING
+		return renderResults() ?? <p className="detection-idle analyzing-pulse">Analysing webcam feed…</p>;
+	}
+
 	return (
 		<section className="deepfake-panel">
 			<div className="video-area">
-				<div className="call-header">
-					<span className="call-dot" /> You are in call
-					<span className="call-timer">00:00</span>
-				</div>
+				<CallStatus
+					status={callStatus}
+					elapsedTime={elapsedTime}
+					errorMessage={errorMessage}
+				/>
 
 				<video
 					ref={remoteVideoRef}
@@ -364,6 +519,14 @@ function Deepfake() {
 					</div>
 				)}
 
+				{callStatus === STATUS.ERROR && errorMessage && (
+					<div className="error-alert">
+						<span className="error-alert-icon">⚠</span>
+						<span className="error-alert-msg">{errorMessage}</span>
+						<button className="retry-btn" onClick={retryCall}>Retry</button>
+					</div>
+				)}
+
 				{showSettings && (
 					<div className="settings-panel">
 						<div className="settings-row">
@@ -388,28 +551,30 @@ function Deepfake() {
 				)}
 
 				<div className="controls">
-					<button onClick={toggleAudio} className="control-btn">
+					<button onClick={toggleAudio} className="control-btn" disabled={!inCall}>
 						{audioEnabled ? "Mute" : "Unmute"}
 					</button>
-					<button onClick={toggleVideo} className="control-btn">
+					<button onClick={toggleVideo} className="control-btn" disabled={!inCall}>
 						{videoEnabled ? "Stop Video" : "Start Video"}
 					</button>
-					<button className="control-btn">Screen Share</button>
-					<button className="control-btn">Chat</button>
-					<button className="control-btn">More</button>
 					<button
 						onClick={() => setShowSettings((v) => !v)}
 						className={`control-btn${showSettings ? " settings-active" : ""}`}
+						disabled={!inCall}
 					>
 						⚙ Settings
 					</button>
-					{!inCall ? (
-						<button onClick={startCall} className="control-btn primary">
-							Start Call
+					{callStatus === STATUS.CONNECTING ? (
+						<button className="control-btn primary" disabled>
+							<span className="btn-spinner" /> Connecting...
 						</button>
-					) : (
+					) : inCall ? (
 						<button onClick={endCall} className="control-btn danger">
 							End Call
+						</button>
+					) : (
+						<button onClick={startCall} className="control-btn primary">
+							Start Call
 						</button>
 					)}
 				</div>
@@ -418,67 +583,7 @@ function Deepfake() {
 			<aside className="detection-panel">
 				<div className="detection-card">
 					<h3 className="detection-title">AI Deepfake Detector</h3>
-
-					{!inCall ? (
-					<p className="detection-idle">Start a call to begin live analysis.</p>
-				) : backendError ? (
-					<p className="detection-error">
-					{backendError}
-					</p>
-				) : !isAnalyzing ? (
-					<p className="detection-idle analyzing-pulse">Analysing webcam feed…</p>
-				) : (
-					detectionResult && (
-							<div className="detection-results">
-								<div
-									className={`verdict-badge ${detectionResult.rolling.verdict === "DEEPFAKE" ? "deepfake" : "real"}`}
-								>
-									{detectionResult.rolling.verdict}
-								</div>
-
-							<div className="ai-explanation">
-								<span className="ai-explanation-title">AI Explanation</span>
-								<p className="ai-explanation-text">
-									{detectionResult.reason || "Analysing recent frames…"}
-								</p>
-							</div>
-								<div className="confidence-label">
-									<span>Deepfake probability</span>
-									<span className="confidence-pct">
-										{(detectionResult.rolling.prob * 100).toFixed(1)}%
-									</span>
-								</div>
-								<div className="confidence-track">
-									<div
-										className={`confidence-fill ${detectionResult.rolling.verdict === "DEEPFAKE" ? "deepfake" : "real"}`}
-										style={{
-											width: `${(detectionResult.rolling.prob * 100).toFixed(1)}%`,
-										}}
-									/>
-								</div>
-
-								<div className="detail-grid">
-									<span className="detail-key">Frames in window</span>
-									<span className="detail-val">
-										{detectionResult.rolling.frames_in_window}
-									</span>
-
-									<span className="detail-key">Face detected</span>
-									<span
-										className={`detail-val ${detectionResult.frame.face_found ? "face-yes" : "face-no"}`}
-									>
-										{detectionResult.frame.face_found ? "Yes" : "No (fallback)"}
-									</span>
-
-									<span className="detail-key">Frame score</span>
-									<span className="detail-val">
-										{(detectionResult.frame.prob * 100).toFixed(1)}%
-									</span>
-								</div>
-
-							</div>
-						)
-					)}
+					{renderDetectionContent()}
 				</div>
 			</aside>
 

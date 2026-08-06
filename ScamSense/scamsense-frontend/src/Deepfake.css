@@ -26,18 +26,66 @@
   left: 12px;
   z-index: 10;
   display: flex;
-  gap: 12px;
+  gap: 10px;
   align-items: center;
   color: #cbd5e1;
   font-weight: 600;
 }
 
+/* Base dot — colour set by modifier class */
 .call-dot {
   width: 10px;
   height: 10px;
-  background: #10b981;
   border-radius: 50%;
   display: inline-block;
+  flex-shrink: 0;
+}
+
+.call-dot--grey   { background: #64748b; }
+.call-dot--green  { background: #10b981; }
+.call-dot--red    { background: #ef4444; }
+.call-dot--yellow {
+  background: #f59e0b;
+  animation: pulse-dot 1s ease-in-out infinite;
+}
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1;   transform: scale(1);   }
+  50%       { opacity: 0.6; transform: scale(1.25); }
+}
+
+.call-status-label {
+  font-size: 13px;
+  color: #cbd5e1;
+}
+
+/* Inline spinner shown in the header while connecting */
+.header-spinner {
+  width: 12px;
+  height: 12px;
+  border: 2px solid rgba(255, 255, 255, 0.25);
+  border-top-color: #fff;
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+  display: inline-block;
+  flex-shrink: 0;
+}
+
+/* Spinner inside the Start-Call button */
+.btn-spinner {
+  width: 10px;
+  height: 10px;
+  border: 2px solid rgba(255, 255, 255, 0.35);
+  border-top-color: #fff;
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+  display: inline-block;
+  vertical-align: middle;
+  margin-right: 4px;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
 }
 
 .call-timer {
@@ -412,6 +460,102 @@
   background: rgba(37, 99, 235, 0.35);
   border: 1px solid rgba(59, 130, 246, 0.5);
   color: #93c5fd;
+}
+
+/* Disabled control buttons */
+.control-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+/* ── Error alert overlay (camera / mic permission denied etc.) ──────────────── */
+.error-alert {
+  position: absolute;
+  top: 56px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 30;
+  background: rgba(220, 38, 38, 0.93);
+  color: #fff;
+  font-size: 13px;
+  padding: 10px 16px;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: 90%;
+  backdrop-filter: blur(6px);
+  line-height: 1.4;
+}
+
+.error-alert-icon {
+  font-size: 16px;
+  flex-shrink: 0;
+}
+
+.error-alert-msg {
+  flex: 1;
+}
+
+.retry-btn {
+  background: rgba(255, 255, 255, 0.2);
+  border: 1px solid rgba(255, 255, 255, 0.45);
+  color: #fff;
+  padding: 4px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+  flex-shrink: 0;
+  transition: background 0.15s;
+}
+
+.retry-btn:hover {
+  background: rgba(255, 255, 255, 0.32);
+}
+
+/* ── Detection panel states ──────────────────────────────────────────────────── */
+
+/* Loading state: spinner + animated text */
+.detection-loading {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  padding: 20px 0;
+}
+
+.detection-spinner {
+  width: 24px;
+  height: 24px;
+  border: 2px solid rgba(96, 165, 250, 0.25);
+  border-top-color: #60a5fa;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  display: block;
+}
+
+/* Message shown after call ends */
+.detection-ended-msg {
+  color: #94a3b8;
+  font-size: 13px;
+  line-height: 1.5;
+  margin: 0 0 14px 0;
+  padding-bottom: 14px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+}
+
+/* Face-not-detected warning inside results */
+.face-warning {
+  font-size: 11px;
+  color: #f59e0b;
+  background: rgba(245, 158, 11, 0.1);
+  border: 1px solid rgba(245, 158, 11, 0.25);
+  border-radius: 6px;
+  padding: 6px 10px;
+  margin: 0;
+  line-height: 1.5;
 }
 
 @media (max-width: 900px) {
