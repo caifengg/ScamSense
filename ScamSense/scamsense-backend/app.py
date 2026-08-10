@@ -1,6 +1,7 @@
 import base64
 import io
 
+import cv2
 import numpy as np
 from flask import Flask, request
 from joblib import load
@@ -474,6 +475,16 @@ def deepfake_heatmap():
         PILImage.fromarray(result["heatmap_rgba"], "RGBA").save(buf, format="PNG")
         heatmap_b64 = base64.b64encode(buf.getvalue()).decode()
 
+    # Normalize bbox to [0-1] fractions of the received frame so the frontend
+    # can correctly map it back regardless of the capture resolution sent.
+    raw_bbox = result.get("bbox")
+    if raw_bbox is not None:
+        fh, fw = frame_rgb.shape[:2]
+        bbox_norm = [raw_bbox[0] / fw, raw_bbox[1] / fh,
+                     raw_bbox[2] / fw, raw_bbox[3] / fh]
+    else:
+        bbox_norm = None
+
     return {
         "frame": {
             "prob": result["prob"],
@@ -483,7 +494,83 @@ def deepfake_heatmap():
         "rolling": rolling,
         "reason": reason,
         "heatmap": heatmap_b64,
-        "bbox": list(result["bbox"]) if result.get("bbox") is not None else None,
+        "bbox": bbox_norm,
+    }
+
+
+@app.route("/deepfake/stylized_heatmap", methods=["POST", "OPTIONS"])
+def deepfake_stylized_heatmap():
+    if request.method == "OPTIONS":
+        return "", 204
+
+    data = request.get_json(silent=True) or {}
+    frame_b64 = data.get("frame")
+    session_id = data.get("session_id", "default")
+
+    if not frame_b64:
+        return {"error": "No frame provided"}, 400
+
+    try:
+        img_bytes = base64.b64decode(frame_b64)
+        img = PILImage.open(io.BytesIO(img_bytes)).convert("RGB")
+        frame_rgb = np.array(img)
+    except Exception as exc:
+        return {"error": f"Invalid frame data: {exc}"}, 400
+
+    try:
+        detector = _get_deepfake_detector()
+    except Exception as exc:
+        return {"error": f"Model unavailable: {exc}"}, 503
+
+    try:
+        result = detector.score_frame_with_stylized_heatmap(frame_rgb)
+    except Exception as exc:
+        return {"error": f"Stylized heatmap scoring failed: {exc}"}, 500
+
+    from jing_model import RollingVerdict
+    if session_id not in _deepfake_sessions:
+        _deepfake_sessions[session_id] = RollingVerdict(window=25)
+
+    prob = result["prob"]
+    face_found = result["face_found"]
+
+    # prob is None when no face was detected — skip rolling update in that case
+    if prob is not None:
+        rolling = _deepfake_sessions[session_id].update(prob, face_found)
+        current_verdict = rolling["verdict"]
+        cached = _deepfake_reasons.get(session_id)
+        if cached is None or cached["verdict"] != current_verdict:
+            reason = generate_deepfake_explanation(
+                verdict=current_verdict,
+                prob=rolling["prob"],
+                face_found=face_found,
+                frames_in_window=rolling["frames_in_window"],
+                frame_prob=prob,
+                max_prob=rolling["max_prob"],
+                min_prob=rolling["min_prob"],
+                deepfake_frames=rolling["deepfake_frames"],
+                real_frames=rolling["real_frames"],
+            )
+            _deepfake_reasons[session_id] = {"verdict": current_verdict, "reason": reason}
+        else:
+            reason = cached["reason"]
+    else:
+        rolling = None
+        reason = ""
+
+    # Encode the already-composited BGR overlay as JPEG
+    ok, buf = cv2.imencode(".jpg", result["heatmap_overlay_bgr"], [cv2.IMWRITE_JPEG_QUALITY, 85])
+    heatmap_b64 = base64.b64encode(buf.tobytes()).decode() if ok else None
+
+    return {
+        "frame": {
+            "prob": prob,
+            "verdict": result["verdict"],
+            "face_found": face_found,
+        },
+        "rolling": rolling,
+        "reason": reason,
+        "heatmap": heatmap_b64,
     }
 
 

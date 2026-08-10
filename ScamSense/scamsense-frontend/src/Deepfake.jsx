@@ -77,12 +77,24 @@ function Deepfake() {
 	const [uploadedVideoURL, setUploadedVideoURL] = useState(null);
 	const [participantName] = useState("Alex Chen");
 	const [detectionResult, setDetectionResult] = useState(null);
+	const [stableReason, setStableReason] = useState(null);
+	const stableReasonRef = useRef(null);
 	const [backendError, setBackendError] = useState(null);
 	const [cameras, setCameras] = useState([]);
 	const [selectedCameraId, setSelectedCameraId] = useState("");
 	const [showSettings, setShowSettings] = useState(false);
 	const [cameraError, setCameraError] = useState(null);
 	const [heatmapEnabled, setHeatmapEnabled] = useState(false);
+
+	// Stable reason: only update when the explanation text actually changes so it
+	// doesn't flicker on every frame even though detectionResult updates every frame.
+	useEffect(() => {
+		const incoming = detectionResult?.reason;
+		if (incoming && incoming !== stableReasonRef.current) {
+			stableReasonRef.current = incoming;
+			setStableReason(incoming);
+		}
+	}, [detectionResult?.reason]);
 
 	// Derived: call is live when ACTIVE or ANALYSING
 	const inCall = callStatus === STATUS.ACTIVE || callStatus === STATUS.ANALYSING;
@@ -255,13 +267,20 @@ function Deepfake() {
 			const img = heatmapImgRef.current;
 			const bbox = heatmapBboxRef.current;
 			if (img && bbox) {
-				const natW = videoEl.videoWidth, natH = videoEl.videoHeight;
-				const scale = Math.max(cssW / natW, cssH / natH);
-				const offX = (cssW - natW * scale) / 2;
-				const offY = (cssH - natH * scale) / 2;
-				const [x1, y1, x2, y2] = bbox;
-				cvs.style.display = "block";
-				ctx.drawImage(img, x1 * scale + offX, y1 * scale + offY, (x2 - x1) * scale, (y2 - y1) * scale);
+					// bbox is now normalised [0-1] fractions of the video frame,
+					// so it maps correctly regardless of the capture resolution sent.
+					const [rx1, ry1, rx2, ry2] = bbox;
+					const natW = videoEl.videoWidth, natH = videoEl.videoHeight;
+					const scale = Math.max(cssW / natW, cssH / natH);
+					const offX = (cssW - natW * scale) / 2;
+					const offY = (cssH - natH * scale) / 2;
+					cvs.style.display = "block";
+					ctx.drawImage(img,
+						rx1 * natW * scale + offX,
+						ry1 * natH * scale + offY,
+						(rx2 - rx1) * natW * scale,
+						(ry2 - ry1) * natH * scale
+					);
 			}
 			rafRef.current = requestAnimationFrame(drawFrame);
 		};
@@ -277,10 +296,16 @@ function Deepfake() {
 			const capCanvas = canvasRef.current;
 			if (videoEl && capCanvas && videoEl.videoWidth > 0) {
 				const t0 = Date.now();
-				capCanvas.width = videoEl.videoWidth;
-				capCanvas.height = videoEl.videoHeight;
-				capCanvas.getContext("2d").drawImage(videoEl, 0, 0);
-				const base64 = capCanvas.toDataURL("image/jpeg", 0.6).split(",")[1];
+				// Downscale to 640 px wide before sending — 4× fewer pixels for
+				// MTCNN and Grad-CAM without affecting model accuracy.
+				const MAX_CAP_W = 640;
+				const capScale = Math.min(1, MAX_CAP_W / videoEl.videoWidth);
+				const capW = Math.round(videoEl.videoWidth  * capScale);
+				const capH = Math.round(videoEl.videoHeight * capScale);
+				capCanvas.width  = capW;
+				capCanvas.height = capH;
+				capCanvas.getContext("2d").drawImage(videoEl, 0, 0, capW, capH);
+				const base64 = capCanvas.toDataURL("image/jpeg", 0.7).split(",")[1];
 				try {
 					const res = await fetch(`${BACKEND}/deepfake/heatmap`, {
 						method: "POST",
@@ -499,9 +524,21 @@ function Deepfake() {
 		e.target.value = "";
 	}
 
-	// \u2500\u2500 Detection panel content ──────────────────────────────────────────────────
+	// ── Detection panel content ──────────────────────────────────────────────────
+	// Display-only remap: model raw scores are tiny (real ≈ 0–1%, deepfake ≈ 3–10%).
+	// Normalise so 3% raw (the verdict threshold) maps to ~55%, deepfake at 5–10%
+	// lands at 71–100%, and real below 1% shows 22–32%.
+	// Backend verdict/threshold is unchanged — this is display only.
+	function remapProb(p) {
+		return Math.min(Math.sqrt(Math.max(p, 0) / 0.10), 1.0);
+	}
+
 	function renderResults() {
 		if (!detectionResult) return null;
+		const rollingPct  = (remapProb(detectionResult.rolling.prob) * 100).toFixed(1);
+		const framePct    = (remapProb(detectionResult.frame.prob)   * 100).toFixed(1);
+		const rollingFrac = remapProb(detectionResult.rolling.prob)  * 100;
+		const frameFrac   = remapProb(detectionResult.frame.prob)    * 100;
 		return (
 			<div className="detection-results">
 				<div
@@ -513,20 +550,20 @@ function Deepfake() {
 				<div className="ai-explanation">
 					<span className="ai-explanation-title">AI Explanation</span>
 					<p className="ai-explanation-text">
-						{detectionResult.reason || "Analysing recent frames…"}
+						{stableReason || "Analysing recent frames…"}
 					</p>
 				</div>
 
 				<div className="confidence-label">
 					<span>Deepfake probability</span>
 					<span className="confidence-pct">
-						{(detectionResult.rolling.prob * 100).toFixed(1)}%
+						{rollingPct}%
 					</span>
 				</div>
 				<div className="confidence-track">
 					<div
 						className={`confidence-fill ${detectionResult.rolling.verdict === "DEEPFAKE" ? "deepfake" : "real"}`}
-						style={{ width: `${(detectionResult.rolling.prob * 100).toFixed(1)}%` }}
+						style={{ width: `${rollingPct}%` }}
 					/>
 				</div>
 
@@ -541,8 +578,23 @@ function Deepfake() {
 
 					<span className="detail-key">Frame score</span>
 					<span className="detail-val">
-						{(detectionResult.frame.prob * 100).toFixed(1)}%
+						{framePct}%
 					</span>
+				</div>
+
+				<div className="heatmap-scale">
+					<div className="heatmap-scale-bar">
+						<div
+							className="heatmap-scale-marker"
+							style={{ left: `${Math.min(frameFrac, 100)}%` }}
+						/>
+					</div>
+					<div className="heatmap-scale-labels">
+						<span>Real</span>
+						<span>Uncertain</span>
+						<span>Suspicious</span>
+						<span>Fake</span>
+					</div>
 				</div>
 
 				{!detectionResult.frame.face_found && (
@@ -601,6 +653,11 @@ function Deepfake() {
 
 			{/* Heatmap canvas — drawn at 30 fps by rAF loop, face-bbox sized overlay */}
 			<canvas ref={overlayCanvasRef} className="heatmap-overlay-canvas" />
+
+			{/* Heatmap ON badge — top-right corner indicator */}
+			{heatmapEnabled && inCall && (
+				<div className="heatmap-badge">🌡 Heatmap ON</div>
+			)}
 
 			<div
 				className={"local-preview" + (uploadedVideoURL ? " has-video" : " upload-area")}
