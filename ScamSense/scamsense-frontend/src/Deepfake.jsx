@@ -61,6 +61,12 @@ function Deepfake() {
 	const mediaStreamRef = useRef(null);
 	const selectedCameraIdRef = useRef("");
 	const inCallRef = useRef(false);
+	const heatmapEnabledRef = useRef(false);
+	const overlayCanvasRef = useRef(null);   // canvas drawn by rAF loop
+	const heatmapImgRef = useRef(null);       // cached face-crop RGBA Image
+	const heatmapBboxRef = useRef(null);      // cached bbox [x1,y1,x2,y2]
+	const rafRef = useRef(null);              // requestAnimationFrame handle
+	const heatmapLoopActiveRef = useRef(false); // cancel flag for fetch loop
 
 	// ── Call state ─────────────────────────────────────────────────────────────────────────
 	const [callStatus, setCallStatus] = useState(STATUS.READY);
@@ -76,9 +82,15 @@ function Deepfake() {
 	const [selectedCameraId, setSelectedCameraId] = useState("");
 	const [showSettings, setShowSettings] = useState(false);
 	const [cameraError, setCameraError] = useState(null);
+	const [heatmapEnabled, setHeatmapEnabled] = useState(false);
 
 	// Derived: call is live when ACTIVE or ANALYSING
 	const inCall = callStatus === STATUS.ACTIVE || callStatus === STATUS.ANALYSING;
+
+	// Sync heatmap ref (loop lifecycle is managed by the dedicated useEffect below)
+	useEffect(() => {
+		heatmapEnabledRef.current = heatmapEnabled;
+	}, [heatmapEnabled]);
 
 	// Keep inCallRef in sync for use inside async closures
 	useEffect(() => {
@@ -149,6 +161,7 @@ function Deepfake() {
 				const videoEl = remoteVideoRef.current;
 				const canvas = canvasRef.current;
 				if (!videoEl || !canvas || videoEl.videoWidth === 0) return;
+				if (heatmapEnabledRef.current) return; // heatmap has its own fetch + rAF loop
 
 				if (currentAbort) currentAbort.abort();
 				currentAbort = new AbortController();
@@ -158,8 +171,12 @@ function Deepfake() {
 				canvas.getContext("2d").drawImage(videoEl, 0, 0);
 				const base64 = canvas.toDataURL("image/jpeg", 0.8).split(",")[1];
 
+				const endpoint = heatmapEnabledRef.current
+					? `${BACKEND}/deepfake/heatmap`
+					: `${BACKEND}/deepfake/score`;
+
 				try {
-					const res = await fetch(`${BACKEND}/deepfake/score`, {
+					const res = await fetch(endpoint, {
 						method: "POST",
 						headers: { "Content-Type": "application/json" },
 						body: JSON.stringify({
@@ -208,6 +225,104 @@ function Deepfake() {
 		};
 	}, [inCall]);
 
+	// ── Heatmap: rAF render loop + adaptive fetch loop ────────────────────────
+	// rAF draws cached heatmap at latest bbox every frame (30 fps, smooth).
+	// Fetch loop fires as fast as backend responds, updating bbox each time and
+	// updating the heatmap image only on Grad-CAM frames (every HEATMAP_STRIDE).
+	useEffect(() => {
+		if (!heatmapEnabled || !inCall) {
+			heatmapLoopActiveRef.current = false;
+			if (rafRef.current) { cancelAnimationFrame(rafRef.current); rafRef.current = null; }
+			const cvs = overlayCanvasRef.current;
+			if (cvs) { cvs.getContext("2d").clearRect(0, 0, cvs.width, cvs.height); cvs.style.display = "none"; }
+			heatmapImgRef.current = null;
+			heatmapBboxRef.current = null;
+			return;
+		}
+
+		// rAF render loop: 30 fps, draws cached heatmap at latest bbox ──────────
+		const drawFrame = () => {
+			const cvs = overlayCanvasRef.current;
+			const videoEl = remoteVideoRef.current;
+			if (!cvs || !videoEl || videoEl.videoWidth === 0) {
+				rafRef.current = requestAnimationFrame(drawFrame);
+				return;
+			}
+			const cssW = videoEl.clientWidth, cssH = videoEl.clientHeight;
+			if (cvs.width !== cssW || cvs.height !== cssH) { cvs.width = cssW; cvs.height = cssH; }
+			const ctx = cvs.getContext("2d");
+			ctx.clearRect(0, 0, cssW, cssH);
+			const img = heatmapImgRef.current;
+			const bbox = heatmapBboxRef.current;
+			if (img && bbox) {
+				const natW = videoEl.videoWidth, natH = videoEl.videoHeight;
+				const scale = Math.max(cssW / natW, cssH / natH);
+				const offX = (cssW - natW * scale) / 2;
+				const offY = (cssH - natH * scale) / 2;
+				const [x1, y1, x2, y2] = bbox;
+				cvs.style.display = "block";
+				ctx.drawImage(img, x1 * scale + offX, y1 * scale + offY, (x2 - x1) * scale, (y2 - y1) * scale);
+			}
+			rafRef.current = requestAnimationFrame(drawFrame);
+		};
+		rafRef.current = requestAnimationFrame(drawFrame);
+
+		// Adaptive fetch loop: fires next request right after previous completes ──
+		heatmapLoopActiveRef.current = true;
+		const MIN_DELAY_MS = 50;
+
+		const fetchLoop = async () => {
+			if (!heatmapLoopActiveRef.current) return;
+			const videoEl = remoteVideoRef.current;
+			const capCanvas = canvasRef.current;
+			if (videoEl && capCanvas && videoEl.videoWidth > 0) {
+				const t0 = Date.now();
+				capCanvas.width = videoEl.videoWidth;
+				capCanvas.height = videoEl.videoHeight;
+				capCanvas.getContext("2d").drawImage(videoEl, 0, 0);
+				const base64 = capCanvas.toDataURL("image/jpeg", 0.6).split(",")[1];
+				try {
+					const res = await fetch(`${BACKEND}/deepfake/heatmap`, {
+						method: "POST",
+						headers: { "Content-Type": "application/json" },
+						body: JSON.stringify({ frame: base64, session_id: sessionIdRef.current }),
+					});
+					if (res.ok && heatmapLoopActiveRef.current) {
+						const data = await res.json();
+						setDetectionResult(data);
+						setCallStatus(prev => prev === STATUS.ACTIVE ? STATUS.ANALYSING : prev);
+						setBackendError(null);
+						if (data.bbox) heatmapBboxRef.current = data.bbox;
+						if (data.heatmap) {
+							const im = new Image();
+							im.onload = () => { heatmapImgRef.current = im; };
+							im.src = `data:image/png;base64,${data.heatmap}`;
+						}
+					}
+				} catch (_) {
+					if (heatmapLoopActiveRef.current)
+						setBackendError("Cannot connect to detection backend — is the Flask server running on port 5000?");
+				}
+				const elapsed = Date.now() - t0;
+				if (heatmapLoopActiveRef.current)
+					setTimeout(fetchLoop, Math.max(0, MIN_DELAY_MS - elapsed));
+			} else {
+				if (heatmapLoopActiveRef.current) setTimeout(fetchLoop, 100);
+			}
+		};
+		const warmup = setTimeout(fetchLoop, 2000);
+
+		return () => {
+			clearTimeout(warmup);
+			heatmapLoopActiveRef.current = false;
+			if (rafRef.current) { cancelAnimationFrame(rafRef.current); rafRef.current = null; }
+			const cvs = overlayCanvasRef.current;
+			if (cvs) { cvs.getContext("2d").clearRect(0, 0, cvs.width, cvs.height); cvs.style.display = "none"; }
+			heatmapImgRef.current = null;
+			heatmapBboxRef.current = null;
+		};
+	}, [heatmapEnabled, inCall]);
+
 	// Re-enumerate cameras whenever devices are added or removed
 	useEffect(() => {
 		if (!navigator.mediaDevices?.addEventListener) return;
@@ -215,6 +330,9 @@ function Deepfake() {
 		navigator.mediaDevices.addEventListener("devicechange", onDeviceChange);
 		return () => navigator.mediaDevices.removeEventListener("devicechange", onDeviceChange);
 	}, []);
+
+	// ── Show full-frame heatmap JPEG in the overlay img element ────────────────
+	function showHeatmap(base64jpeg) { /* no-op: replaced by rAF canvas loop */ }
 
 	async function enumerateCameras() {
 		try {
@@ -481,15 +599,18 @@ function Deepfake() {
 					muted
 				/>
 
-				<div
-					className={"local-preview" + (uploadedVideoURL ? " has-video" : " upload-area")}
-					onClick={() => {
-						if (!uploadedVideoURL) onLocalPreviewClick();
-					}}
-					role="button"
-					tabIndex={0}
-				>
-					<input
+			{/* Heatmap canvas — drawn at 30 fps by rAF loop, face-bbox sized overlay */}
+			<canvas ref={overlayCanvasRef} className="heatmap-overlay-canvas" />
+
+			<div
+				className={"local-preview" + (uploadedVideoURL ? " has-video" : " upload-area")}
+				onClick={() => {
+					if (!uploadedVideoURL) onLocalPreviewClick();
+				}}
+				role="button"
+				tabIndex={0}
+			>
+				<input
 						ref={fileInputRef}
 						type="file"
 						accept="video/mp4,video/quicktime,video/x-msvideo,video/*"
@@ -560,9 +681,16 @@ function Deepfake() {
 					<button
 						onClick={() => setShowSettings((v) => !v)}
 						className={`control-btn${showSettings ? " settings-active" : ""}`}
-						disabled={!inCall}
 					>
 						⚙ Settings
+					</button>
+					<button
+						onClick={() => setHeatmapEnabled((v) => !v)}
+						className={`control-btn${heatmapEnabled ? " heatmap-active" : ""}`}
+						disabled={!inCall}
+						title="Toggle Grad-CAM heatmap overlay"
+					>
+						🌡 Heatmap
 					</button>
 					{callStatus === STATUS.CONNECTING ? (
 						<button className="control-btn primary" disabled>

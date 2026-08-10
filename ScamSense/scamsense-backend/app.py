@@ -410,6 +410,83 @@ def deepfake_score():
     }
 
 
+@app.route("/deepfake/heatmap", methods=["POST", "OPTIONS"])
+def deepfake_heatmap():
+    if request.method == "OPTIONS":
+        return "", 204
+
+    data = request.get_json(silent=True) or {}
+    frame_b64 = data.get("frame")
+    session_id = data.get("session_id", "default")
+
+    if not frame_b64:
+        return {"error": "No frame provided"}, 400
+
+    try:
+        img_bytes = base64.b64decode(frame_b64)
+        img = PILImage.open(io.BytesIO(img_bytes)).convert("RGB")
+        frame_rgb = np.array(img)
+    except Exception as exc:
+        return {"error": f"Invalid frame data: {exc}"}, 400
+
+    try:
+        detector = _get_deepfake_detector()
+    except Exception as exc:
+        return {"error": f"Model unavailable: {exc}"}, 503
+
+    try:
+        result = detector.score_frame_with_heatmap(frame_rgb)
+    except Exception as exc:
+        return {"error": f"Heatmap scoring failed: {exc}"}, 500
+
+    from jing_model import RollingVerdict
+    if session_id not in _deepfake_sessions:
+        _deepfake_sessions[session_id] = RollingVerdict(window=25)
+
+    rolling = _deepfake_sessions[session_id].update(
+        result["prob"], result["face_found"]
+    )
+
+    current_verdict = rolling["verdict"]
+    cached = _deepfake_reasons.get(session_id)
+    if cached is None or cached["verdict"] != current_verdict:
+        reason = generate_deepfake_explanation(
+            verdict=current_verdict,
+            prob=rolling["prob"],
+            face_found=result["face_found"],
+            frames_in_window=rolling["frames_in_window"],
+            frame_prob=result["prob"],
+            max_prob=rolling["max_prob"],
+            min_prob=rolling["min_prob"],
+            deepfake_frames=rolling["deepfake_frames"],
+            real_frames=rolling["real_frames"],
+        )
+        _deepfake_reasons[session_id] = {"verdict": current_verdict, "reason": reason}
+    else:
+        reason = cached["reason"]
+
+    # Encode face-crop RGBA as PNG only on Grad-CAM frames (None on throttled frames).
+    # The frontend re-uses its cached heatmap image and repositions it via bbox,
+    # decoupling visual render rate (30 fps rAF) from backend compute rate.
+    heatmap_b64 = None
+    if result.get("heatmap_rgba") is not None:
+        buf = io.BytesIO()
+        PILImage.fromarray(result["heatmap_rgba"], "RGBA").save(buf, format="PNG")
+        heatmap_b64 = base64.b64encode(buf.getvalue()).decode()
+
+    return {
+        "frame": {
+            "prob": result["prob"],
+            "verdict": result["verdict"],
+            "face_found": result["face_found"],
+        },
+        "rolling": rolling,
+        "reason": reason,
+        "heatmap": heatmap_b64,
+        "bbox": list(result["bbox"]) if result.get("bbox") is not None else None,
+    }
+
+
 @app.route("/deepfake/reset", methods=["POST", "OPTIONS"])
 def deepfake_reset():
     if request.method == "OPTIONS":
