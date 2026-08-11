@@ -1,3 +1,4 @@
+import base64
 import os
 import re
 from urllib.parse import urlparse
@@ -373,3 +374,77 @@ def translate_to_english(message: str) -> dict:
         return {"text": message, "was_translated": False, "detected_language": None, "available": False}
 
     return {"text": translation, "was_translated": True, "detected_language": language, "available": True}
+
+
+# ── Screenshot text extraction (Text Extractor's screenshot upload) ─────────
+#
+# Lets a user upload a screenshot of an SMS/chat app instead of retyping the
+# message. Gemini vision transcribes just the message body, which the
+# frontend then drops into the same textarea used for pasted text - the
+# extracted text still goes through translate_to_english/preprocess_text/
+# text_tfidf/text_model exactly as if the user had typed it, and the user
+# gets a chance to review/correct the transcription before hitting
+# "Check Message". This function only extracts text; it never classifies.
+
+def _build_image_ocr_prompt() -> str:
+    return """You are an OCR assistant inside a scam-message detector app called ScamSense.
+
+Look at the attached screenshot of an SMS or chat message. Transcribe ONLY the
+message text itself, exactly as written, preserving line breaks.
+
+Do not include sender names, contact names, timestamps, phone status bar
+text (signal/battery/clock), app UI labels, or any commentary of your own.
+If more than one message is visible, transcribe only the main/most recent
+message. If no legible message text is visible, respond with exactly:
+NO_TEXT_FOUND
+
+Respond with the transcribed message text only - nothing else."""
+
+
+def extract_text_from_image(image_bytes: bytes, mime_type: str = "image/jpeg") -> dict:
+    """
+    Returns a dict: {"text": str, "available": bool, "error": str|None}
+
+    "available" is False whenever transcription couldn't be produced (missing
+    key, network error, safety block, unreadable image, etc) - the caller
+    should surface "error" to the user rather than silently classifying an
+    empty/garbage string.
+    """
+    if not GEMINI_API_KEY:
+        return {"text": "", "available": False, "error": "AI text extraction is not configured (missing GEMINI_API_KEY)."}
+
+    image_b64 = base64.b64encode(image_bytes).decode()
+    prompt = _build_image_ocr_prompt()
+
+    payload = {
+        "contents": [{
+            "parts": [
+                {"text": prompt},
+                {"inline_data": {"mime_type": mime_type, "data": image_b64}},
+            ]
+        }]
+    }
+    headers = {"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY}
+
+    try:
+        response = requests.post(GEMINI_URL, json=payload, headers=headers, timeout=REQUEST_TIMEOUT)
+    except requests.RequestException:
+        return {"text": "", "available": False, "error": "Could not reach the AI text extraction service. Please try again."}
+
+    if response.status_code != 200:
+        return {"text": "", "available": False, "error": f"AI text extraction service returned an error (status {response.status_code})."}
+
+    data = response.json()
+    candidates = data.get("candidates", [])
+    if not candidates:
+        return {"text": "", "available": False, "error": "The screenshot could not be processed (blocked or empty response)."}
+
+    try:
+        text = candidates[0]["content"]["parts"][0]["text"].strip()
+    except (KeyError, IndexError):
+        return {"text": "", "available": False, "error": "Could not parse the AI text extraction response."}
+
+    if text.upper() == "NO_TEXT_FOUND":
+        return {"text": "", "available": False, "error": "No readable message text was found in that screenshot."}
+
+    return {"text": text, "available": True, "error": None}

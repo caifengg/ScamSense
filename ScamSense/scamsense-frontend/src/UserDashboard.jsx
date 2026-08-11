@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import axios from "axios";
 import { useNavigate } from "react-router-dom";
 
@@ -37,7 +37,56 @@ function UserDashboard() {
   const [textLoading, setTextLoading] = useState(false);  // true while /detect-text is in flight
   const [textError, setTextError] = useState("");         // network/request-level error only
 
+  // Screenshot upload state - kept separate from the /detect-text loading/error
+  // state above since extraction and classification are two independent
+  // requests the user can trigger at different times.
+  const [textExtracting, setTextExtracting] = useState(false);  // true while /extract-text-from-image is in flight
+  const [textExtractError, setTextExtractError] = useState(""); // error from the screenshot step only
+
+  // Flag-as-wrong state for the currently-shown result only. `textCheckId` is
+  // the text_checks row id the backend returned for the last /detect-text
+  // call (null if it couldn't be saved, e.g. not logged in or DB down) -
+  // the flag button is hidden whenever this is null. `textFlagged` flips to
+  // true after a successful flag and disables the button, since each check
+  // can only be flagged once (also enforced server-side).
+  const [textCheckId, setTextCheckId] = useState(null);
+  const [textFlagged, setTextFlagged] = useState(false);
+  const [textFlagging, setTextFlagging] = useState(false);
+  const [textFlagError, setTextFlagError] = useState("");
+
+  // Recent-checks history (Text Extractor only).
+  const [textHistory, setTextHistory] = useState([]);
+  const [textHistoryLoading, setTextHistoryLoading] = useState(false);
+  const [textHistoryError, setTextHistoryError] = useState("");
+  const [textHistoryDeletingId, setTextHistoryDeletingId] = useState(null);
+
+  const userId = localStorage.getItem("scamsenseUserId");
+
   const navigate = useNavigate();
+
+  // Loads (or reloads) the current user's Text Extractor history. Called on
+  // mount and after every successful check/flag/delete so the list always
+  // reflects the latest state without a manual refresh.
+  const fetchTextHistory = async () => {
+    if (!userId) return;
+
+    setTextHistoryLoading(true);
+    setTextHistoryError("");
+
+    try {
+      const response = await axios.get("/text-checks", { params: { user_id: userId } });
+      setTextHistory(response.data.checks);
+    } catch {
+      setTextHistoryError("Could not load history. Check backend and try again.");
+    } finally {
+      setTextHistoryLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchTextHistory();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const checkURL = async () => {
     setLoading(true);
@@ -69,7 +118,7 @@ function UserDashboard() {
     setTextError("");  // clear any previous request's error before trying again
 
     try {
-      const response = await axios.post("/detect-text", { message });
+      const response = await axios.post("/detect-text", { message, user_id: userId });
 
       setTextResult(response.data.result);
       setTextConfidence(response.data.confidence);
@@ -82,6 +131,12 @@ function UserDashboard() {
       setTextTranslated(response.data.translated);
       setTextTranslatedText(response.data.translated_text);
       setTextDetectedLanguage(response.data.detected_language);
+      // New check → reset flag state for it (a fresh check_id has never
+      // been flagged yet) and refresh the history list to include it.
+      setTextCheckId(response.data.check_id);
+      setTextFlagged(false);
+      setTextFlagError("");
+      fetchTextHistory();
     } catch {
       // Covers network failures, the backend being down, or a non-2xx
       // response - deliberately generic rather than surfacing raw axios
@@ -92,9 +147,91 @@ function UserDashboard() {
     }
   };
 
+  // Handler for TextExtractor's "Flag as wrong" button. Only shown/enabled
+  // for a check that was actually saved (textCheckId != null) and hasn't
+  // already been flagged. The backend still enforces "one flag per check"
+  // itself (see flag_text_check() in app.py), so this frontend check is
+  // just to keep the button from being clickable twice in normal use.
+  const flagTextCheck = async () => {
+    if (!textCheckId || textFlagged) return;
+
+    setTextFlagging(true);
+    setTextFlagError("");
+
+    try {
+      await axios.post(`/text-checks/${textCheckId}/flag`, { user_id: userId });
+      setTextFlagged(true);
+      fetchTextHistory();
+    } catch (err) {
+      const backendMessage = err?.response?.data?.error;
+      // A 409 here almost always means it was already flagged (e.g. a
+      // duplicate click that raced ahead of the button disabling) - treat
+      // that the same as success rather than showing a scary error.
+      if (err?.response?.status === 409) {
+        setTextFlagged(true);
+      } else {
+        setTextFlagError(backendMessage || "Could not flag this result. Check backend and try again.");
+      }
+    } finally {
+      setTextFlagging(false);
+    }
+  };
+
+  // Handler for deleting one row from the Text Extractor's history list.
+  // Only removes the history entry - it does not clear whatever result is
+  // currently shown above, even if that result happens to be the same check.
+  const deleteTextHistoryEntry = async (id) => {
+    setTextHistoryDeletingId(id);
+    setTextHistoryError("");
+
+    try {
+      await axios.delete(`/text-checks/${id}`, { params: { user_id: userId } });
+      setTextHistory((prev) => prev.filter((entry) => entry.id !== id));
+    } catch {
+      setTextHistoryError("Could not delete that entry. Check backend and try again.");
+    } finally {
+      setTextHistoryDeletingId(null);
+    }
+  };
+
+  // Handler for TextExtractor's "Upload Screenshot" input. Reads the file as
+  // a base64 data URL, sends it to /extract-text-from-image (Gemini vision
+  // transcription only - no classification happens here), then drops the
+  // transcribed text into the same `message` state the textarea uses, so the
+  // user can review/edit it before clicking "Check Message" as normal.
+  const uploadScreenshot = async (file) => {
+    setTextExtracting(true);
+    setTextExtractError("");
+
+    try {
+      const dataUrl = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => reject(reader.error);
+        reader.readAsDataURL(file);
+      });
+
+      const response = await axios.post("/extract-text-from-image", {
+        image: dataUrl,
+        mime_type: file.type || "image/jpeg",
+      });
+
+      setMessage(response.data.text);
+    } catch (err) {
+      // A 422 from the backend means the screenshot itself couldn't be read
+      // (unreadable image, no text found) - surface that specific message
+      // when available, otherwise fall back to a generic one.
+      const backendMessage = err?.response?.data?.error;
+      setTextExtractError(backendMessage || "Could not read that screenshot. Check backend and try again.");
+    } finally {
+      setTextExtracting(false);
+    }
+  };
+
   const logout = () => {
     localStorage.removeItem("scamsenseAuth");
     localStorage.removeItem("scamsenseRole");
+    localStorage.removeItem("scamsenseUserId");
     navigate("/", { replace: true });
   };
 
@@ -170,6 +307,19 @@ function UserDashboard() {
             loading={textLoading}
             error={textError}
             onCheckMessage={checkMessage}
+            onUploadScreenshot={uploadScreenshot}
+            extracting={textExtracting}
+            extractError={textExtractError}
+            checkId={textCheckId}
+            flagged={textFlagged}
+            flagging={textFlagging}
+            flagError={textFlagError}
+            onFlagWrong={flagTextCheck}
+            history={textHistory}
+            historyLoading={textHistoryLoading}
+            historyError={textHistoryError}
+            historyDeletingId={textHistoryDeletingId}
+            onDeleteHistoryEntry={deleteTextHistoryEntry}
           />
         )}
 

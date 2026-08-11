@@ -21,6 +21,7 @@ from gemini_explainer import (
     generate_deepfake_explanation,
     generate_text_explanation,  # writes the text-extractor explanation
     translate_to_english,       # translates non-English input before classification
+    extract_text_from_image,    # transcribes SMS screenshots for the text extractor
 )
 
 MODEL_PATH = Path(__file__).resolve().with_name("phishing_model.pkl")
@@ -172,6 +173,7 @@ def login():
         return {
             "success": True,
             "role": user[4],
+            "user_id": user[0],
         }
 
     return {
@@ -254,6 +256,7 @@ def detect_text():
 
     data = request.get_json(silent=True) or {}
     message = data.get("message", "")
+    user_id = data.get("user_id")
 
     if not message or not message.strip():
         return {"error": "No message provided"}, 400
@@ -296,6 +299,30 @@ def detect_text():
     # Step 4: ask Gemini to explain the verdict above.
     explanation_result = generate_text_explanation(english_message, result, confidence)
 
+    # Save this check to the user's history (Text Extractor only - the
+    # phishing/deepfake tools have their own separate storage/no storage).
+    # This is best-effort: if there's no user_id (not logged in) or the DB
+    # is unavailable, the check still returns normally, it just isn't saved
+    # and check_id comes back null - the frontend then simply can't show a
+    # flag button or history entry for that particular check.
+    check_id = None
+    if user_id is not None and connection is not None and cursor is not None:
+        try:
+            cursor.execute(
+                """
+                INSERT INTO text_checks
+                (user_id, message, result, confidence)
+
+                VALUES
+                (%s, %s, %s, %s)
+                """,
+                (user_id, message, result, confidence),
+            )
+            connection.commit()
+            check_id = cursor.lastrowid
+        except Exception:
+            connection.rollback()
+
     return {
         "result": result,
         "confidence": confidence,
@@ -307,7 +334,167 @@ def detect_text():
         "translated": translation["was_translated"],
         "translated_text": english_message if translation["was_translated"] else None,
         "detected_language": translation["detected_language"],
+        # id of the saved text_checks row, used by the frontend to flag/delete
+        # this specific check later - null if it couldn't be saved.
+        "check_id": check_id,
     }
+
+
+@app.route("/extract-text-from-image", methods=["POST", "OPTIONS"])
+def extract_text_from_image_route():
+    """
+    Text Extractor's screenshot-upload endpoint. Given a base64-encoded
+    image of an SMS/chat screenshot, this only transcribes the message text
+    via Gemini vision (extract_text_from_image) - it does NOT classify
+    anything. The frontend drops the returned text into the same textarea
+    used for pasted messages, lets the user review/edit it, and classification
+    still happens through the existing /detect-text flow when they click
+    "Check Message". Kept as a separate endpoint so /detect-text's
+    translate -> preprocess -> vectorize -> predict pipeline is untouched.
+    """
+    if request.method == "OPTIONS":
+        return "", 204
+
+    data = request.get_json(silent=True) or {}
+    image_b64 = data.get("image", "")
+    mime_type = data.get("mime_type") or "image/jpeg"
+
+    if not image_b64:
+        return {"error": "No image provided"}, 400
+
+    # Accept both raw base64 and data URLs (e.g. "data:image/png;base64,....").
+    if "," in image_b64 and image_b64.strip().lower().startswith("data:"):
+        header, image_b64 = image_b64.split(",", 1)
+        if "image/" in header:
+            mime_type = header.split(";")[0].replace("data:", "") or mime_type
+
+    try:
+        image_bytes = base64.b64decode(image_b64)
+    except Exception:
+        return {"error": "Invalid image data"}, 400
+
+    extraction = extract_text_from_image(image_bytes, mime_type)
+
+    if not extraction["available"]:
+        return {"error": extraction["error"] or "Could not extract text from that screenshot."}, 422
+
+    return {"text": extraction["text"]}
+
+
+@app.route("/text-checks", methods=["GET", "OPTIONS"])
+def list_text_checks():
+    """
+    Text Extractor's "recent checks" history for one user. `user_id` is
+    passed as a query param (?user_id=123) rather than requiring a full auth
+    header, matching the rest of this app's lightweight, session-token-free
+    auth model (see /login above).
+    """
+    if request.method == "OPTIONS":
+        return "", 204
+
+    db_error = ensure_db_ready()
+    if db_error:
+        return db_error
+
+    user_id = request.args.get("user_id")
+    if not user_id:
+        return {"error": "user_id is required"}, 400
+
+    cursor.execute(
+        """
+        SELECT id, message, result, confidence, flagged, created_at
+        FROM text_checks
+        WHERE user_id=%s
+        ORDER BY created_at DESC
+        LIMIT 50
+        """,
+        (user_id,),
+    )
+    rows = cursor.fetchall()
+
+    checks = [
+        {
+            "id": row[0],
+            "message": row[1],
+            "result": row[2],
+            "confidence": row[3],
+            "flagged": bool(row[4]),
+            "created_at": row[5].isoformat() if row[5] else None,
+        }
+        for row in rows
+    ]
+
+    return {"checks": checks}
+
+
+@app.route("/text-checks/<int:check_id>/flag", methods=["POST", "OPTIONS"])
+def flag_text_check(check_id):
+    """
+    Marks one text_checks row as "flagged as wrong" by its owner. Enforces
+    "one flag per check" server-side - `UPDATE ... WHERE id=%s AND
+    user_id=%s AND flagged=FALSE` only ever affects a row the very first
+    time it's flagged (rowcount is 0 on every call after that, or if the
+    check belongs to someone else), so replaying this request can't spam
+    flags on the same row or flag another user's check.
+    """
+    if request.method == "OPTIONS":
+        return "", 204
+
+    db_error = ensure_db_ready()
+    if db_error:
+        return db_error
+
+    data = request.get_json(silent=True) or {}
+    user_id = data.get("user_id")
+    if not user_id:
+        return {"error": "user_id is required"}, 400
+
+    cursor.execute(
+        """
+        UPDATE text_checks
+        SET flagged=TRUE
+        WHERE id=%s AND user_id=%s AND flagged=FALSE
+        """,
+        (check_id, user_id),
+    )
+    connection.commit()
+
+    if cursor.rowcount == 0:
+        # Either this check doesn't belong to this user, doesn't exist, or
+        # (most commonly) was already flagged once before.
+        return {"error": "Check not found, not yours, or already flagged."}, 409
+
+    return {"message": "flagged"}
+
+
+@app.route("/text-checks/<int:check_id>", methods=["DELETE", "OPTIONS"])
+def delete_text_check(check_id):
+    """
+    Deletes one text_checks row - only the row's own user can delete it.
+    `user_id` is required in the query string so a user can't delete another
+    user's history entry just by guessing an id.
+    """
+    if request.method == "OPTIONS":
+        return "", 204
+
+    db_error = ensure_db_ready()
+    if db_error:
+        return db_error
+
+    user_id = request.args.get("user_id")
+    if not user_id:
+        return {"error": "user_id is required"}, 400
+
+    cursor.execute(
+        "DELETE FROM text_checks WHERE id=%s AND user_id=%s",
+        (check_id, user_id),
+    )
+    connection.commit()
+
+    if cursor.rowcount == 0:
+        return {"error": "Check not found or not yours."}, 404
+
+    return {"message": "deleted"}
 
 
 @app.route("/admin/stats", methods=["GET", "OPTIONS"])

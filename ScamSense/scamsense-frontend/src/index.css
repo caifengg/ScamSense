@@ -223,8 +223,26 @@ textarea:focus {
 .text-detector-actions {
   display: flex;
   justify-content: flex-end;
+  align-items: center;
+  gap: 12px;
   margin-top: 12px;
   margin-bottom: 16px;
+}
+
+.screenshot-upload-label {
+  border: 1.5px solid var(--accent);
+  border-radius: 12px;
+  padding: 10.5px 18px;
+  background: transparent;
+  color: var(--accent);
+  font-weight: 700;
+  cursor: pointer;
+  transition: transform 0.16s ease, box-shadow 0.2s ease;
+}
+
+.screenshot-upload-label:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 12px 18px rgba(217, 93, 57, 0.15);
 }
 
 button {
@@ -431,6 +449,117 @@ button:disabled {
   font-size: 14px;
   line-height: 1.5;
   color: var(--ink);
+}
+
+/* "This looks wrong" flag button - lives inside .result-pill, so it inherits
+   that section's safe/danger tint. Kept small and understated (text-only
+   style) since flagging is a secondary action relative to the result itself. */
+.flag-wrong-row {
+  margin-top: 10px;
+}
+
+.flag-wrong-button {
+  background: transparent;
+  color: inherit;
+  border: 1px solid currentColor;
+  opacity: 0.75;
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  border-radius: 8px;
+}
+
+.flag-wrong-button:hover:not(:disabled) {
+  opacity: 1;
+  transform: none;
+  box-shadow: none;
+}
+
+.flag-wrong-button:disabled {
+  opacity: 0.55;
+}
+
+/* Recent Checks history list */
+.text-history {
+  margin-top: 24px;
+}
+
+.text-history-label {
+  font-family: "Space Grotesk", "Segoe UI", sans-serif;
+  font-size: 13px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+
+.text-history-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 360px;
+  overflow-y: auto;
+}
+
+.text-history-item {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  border-radius: 12px;
+  padding: 10px 14px;
+  border: 1px solid;
+}
+
+.text-history-item.safe {
+  border-color: rgba(34, 117, 71, 0.25);
+  background: rgba(34, 117, 71, 0.06);
+}
+
+.text-history-item.danger {
+  border-color: rgba(182, 41, 34, 0.25);
+  background: rgba(182, 41, 34, 0.06);
+}
+
+.text-history-item-main {
+  min-width: 0;
+}
+
+.text-history-message {
+  font-size: 13px;
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+.text-history-meta {
+  margin-top: 4px;
+  font-size: 12px;
+  opacity: 0.7;
+}
+
+.text-history-delete {
+  flex-shrink: 0;
+  background: transparent;
+  color: var(--danger);
+  border: 1px solid rgba(182, 41, 34, 0.35);
+  padding: 6px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  border-radius: 8px;
+}
+
+.text-history-delete:hover:not(:disabled) {
+  transform: none;
+  box-shadow: none;
+  background: rgba(182, 41, 34, 0.1);
 }
 
 .stats-grid {

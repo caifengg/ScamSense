@@ -27,6 +27,7 @@ function Login() {
       if (response.data.success && response.data.role === "admin") {
         localStorage.setItem("scamsenseAuth", "true");
         localStorage.setItem("scamsenseRole", "admin");
+        localStorage.setItem("scamsenseUserId", String(response.data.user_id));
         navigate("/admin", { replace: true });
         return;
       }
@@ -34,6 +35,7 @@ function Login() {
       if (response.data.success) {
         localStorage.setItem("scamsenseAuth", "true");
         localStorage.setItem("scamsenseRole", "user");
+        localStorage.setItem("scamsenseUserId", String(response.data.user_id));
         navigate("/user", { replace: true });
         return;
       }
