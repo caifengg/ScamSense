@@ -163,75 +163,73 @@ function Deepfake() {
 		setBackendError(null);
 
 		let isMounted = true;
-		let currentAbort = null;
 
-		// Small delay so the camera stream has time to fully initialise
-		const startTimer = setTimeout(() => {
+		// Sequential fetch loop — waits for each response before sending the next frame.
+		// The old setInterval + abort approach cancelled every request before the
+		// backend (>1 s inference) could respond, so no results ever arrived.
+		// Loop keeps running while in-call; it skips the network request (but still
+		// reschedules) when heatmap is active so it restarts automatically on toggle-off.
+		const scoreLoop = async () => {
 			if (!isMounted) return;
 
-			analyzeIntervalRef.current = setInterval(async () => {
+			if (!heatmapEnabledRef.current) {
 				const videoEl = remoteVideoRef.current;
 				const canvas = canvasRef.current;
-				if (!videoEl || !canvas || videoEl.videoWidth === 0) return;
-				if (heatmapEnabledRef.current) return; // heatmap has its own fetch + rAF loop
+				if (videoEl && canvas && videoEl.videoWidth > 0) {
+					canvas.width = videoEl.videoWidth;
+					canvas.height = videoEl.videoHeight;
+					canvas.getContext("2d").drawImage(videoEl, 0, 0);
+					const base64 = canvas.toDataURL("image/jpeg", 0.8).split(",")[1];
 
-				if (currentAbort) currentAbort.abort();
-				currentAbort = new AbortController();
-
-				canvas.width = videoEl.videoWidth;
-				canvas.height = videoEl.videoHeight;
-				canvas.getContext("2d").drawImage(videoEl, 0, 0);
-				const base64 = canvas.toDataURL("image/jpeg", 0.8).split(",")[1];
-
-				const endpoint = heatmapEnabledRef.current
-					? `${BACKEND}/deepfake/heatmap`
-					: `${BACKEND}/deepfake/score`;
-
-				try {
-					const res = await fetch(endpoint, {
-						method: "POST",
-						headers: { "Content-Type": "application/json" },
-						body: JSON.stringify({
-							frame: base64,
-							session_id: sessionIdRef.current,
-						}),
-						signal: currentAbort.signal,
-					});
-					if (res.ok) {
-						const data = await res.json();
-						if (isMounted) {
-							setDetectionResult(data);
-							// Transition ACTIVE → ANALYSING on first result
-							setCallStatus((prev) =>
-								prev === STATUS.ACTIVE ? STATUS.ANALYSING : prev
+					try {
+						const res = await fetch(`${BACKEND}/deepfake/score`, {
+							method: "POST",
+							headers: { "Content-Type": "application/json" },
+							body: JSON.stringify({
+								frame: base64,
+								session_id: sessionIdRef.current,
+							}),
+						});
+						if (!isMounted) return;
+						if (res.ok) {
+							const data = await res.json();
+							if (isMounted) {
+								setDetectionResult(data);
+								setCallStatus((prev) =>
+									prev === STATUS.ACTIVE ? STATUS.ANALYSING : prev
+								);
+								setBackendError(null);
+							}
+						} else {
+							if (isMounted) {
+								let msg = `Detection server error (HTTP ${res.status})`;
+								try { const body = await res.json(); if (body?.error) msg = body.error; } catch (_) {}
+								setBackendError(msg);
+							}
+						}
+					} catch (err) {
+						if (isMounted)
+							setBackendError(
+								"Cannot connect to detection backend — is the Flask server running on port 5000?"
 							);
-							setBackendError(null);
-						}
-					} else {
-						if (isMounted) {
-							let msg = `Detection server error (HTTP ${res.status})`;
-							try {
-								const body = await res.json();
-								if (body?.error) msg = body.error;
-							} catch (_) { /* body was not JSON */ }
-							setBackendError(msg);
-						}
 					}
-				} catch (err) {
-					if (err.name !== "AbortError" && isMounted)
-						setBackendError(
-							"Cannot connect to detection backend — is the Flask server running on port 5000?"
-						);
 				}
-			}, 1000);
-		}, 2000); // 2 s warm-up before first capture
+			}
+
+			// Always reschedule so toggling heatmap off restarts scoring automatically
+			if (isMounted) {
+				analyzeIntervalRef.current = setTimeout(scoreLoop, heatmapEnabledRef.current ? 200 : 100);
+			}
+		};
+
+		// 2 s warm-up before first capture so the camera stream can initialise
+		const startTimer = setTimeout(scoreLoop, 2000);
 
 		return () => {
 			isMounted = false;
 			clearTimeout(startTimer);
-			if (currentAbort) currentAbort.abort();
 			if (analyzeIntervalRef.current) {
-				clearInterval(analyzeIntervalRef.current);
+				clearTimeout(analyzeIntervalRef.current);
 				analyzeIntervalRef.current = null;
 			}
 		};
@@ -525,20 +523,33 @@ function Deepfake() {
 	}
 
 	// ── Detection panel content ──────────────────────────────────────────────────
-	// Display-only remap: model raw scores are tiny (real ≈ 0–1%, deepfake ≈ 3–10%).
-	// Normalise so 3% raw (the verdict threshold) maps to ~55%, deepfake at 5–10%
-	// lands at 71–100%, and real below 1% shows 22–32%.
+	// Display-only remap: keep real results visually low while presenting scores
+	// above the model's 3% deepfake threshold in a clear 80-95% range.
 	// Backend verdict/threshold is unchanged — this is display only.
-	function remapProb(p) {
-		return Math.min(Math.sqrt(Math.max(p, 0) / 0.10), 1.0);
+	function remapProb(probability, verdict) {
+		const raw = Math.max(Number(probability) || 0, 0);
+		if (verdict === "DEEPFAKE") {
+			const strength = Math.min(Math.max((raw - 0.03) / 0.07, 0), 1);
+			return 0.8 + strength * 0.15;
+		}
+
+		return 0.05 + Math.min(raw / 0.03, 1) * 0.25;
 	}
 
 	function renderResults() {
 		if (!detectionResult) return null;
-		const rollingPct  = (remapProb(detectionResult.rolling.prob) * 100).toFixed(1);
-		const framePct    = (remapProb(detectionResult.frame.prob)   * 100).toFixed(1);
-		const rollingFrac = remapProb(detectionResult.rolling.prob)  * 100;
-		const frameFrac   = remapProb(detectionResult.frame.prob)    * 100;
+		const rollingPct = (remapProb(
+			detectionResult.rolling.prob,
+			detectionResult.rolling.verdict
+		) * 100).toFixed(1);
+		const framePct = (remapProb(
+			detectionResult.frame.prob,
+			detectionResult.frame.verdict
+		) * 100).toFixed(1);
+		const frameFrac = remapProb(
+			detectionResult.frame.prob,
+			detectionResult.frame.verdict
+		) * 100;
 		return (
 			<div className="detection-results">
 				<div

@@ -347,6 +347,7 @@ class Detector:
         self._heatmap_tick: int = 0
         self._cached_score_map: Optional[np.ndarray] = None   # last computed raw CAM
         self._cached_heatmap_bbox: Optional[tuple] = None     # last (x1,y1,x2,y2) in frame coords
+        self._cached_region_attribution: list = []
 
         # ── MediaPipe Face Mesh ────────────────────────────────────────────
         # When available, FaceMesh traces the actual face oval so the heatmap
@@ -375,30 +376,57 @@ class Detector:
 
     @torch.no_grad()
     def score_frame(self, frame_rgb: np.ndarray) -> dict:
-        """Score a single RGB frame (HxWx3 numpy array). Returns this frame's
-        probability alone — no temporal smoothing (see RollingVerdict for that)."""
-        face_pil, face_found = get_face_pil(
-            frame_rgb, self.mtcnn, self.mtcnn_sensitive, self._last_good_crop
-        )
+        """Score a single RGB frame. Uses the same bbox-crop face extraction as
+        score_frame_with_heatmap so both modes produce consistent probabilities."""
+        H, W = frame_rgb.shape[:2]
+        pil_full = Image.fromarray(frame_rgb)
+
+        boxes, _ = self.mtcnn.detect(pil_full)
+        face_found = False
+        face_pil = None
+
+        if boxes is not None and len(boxes) > 0:
+            x1, y1, x2, y2 = (int(v) for v in boxes[0])
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(W, x2), min(H, y2)
+            if x2 > x1 and y2 > y1:
+                face_found = True
+                if _HAS_EXTRACT_FACE:
+                    try:
+                        ft = extract_face(pil_full, boxes[0], image_size=IMG_SIZE, margin=14)
+                        face_pil = Image.fromarray(ft.permute(1, 2, 0).byte().numpy())
+                    except Exception:
+                        face_pil = None
+                if face_pil is None:
+                    bw_box = boxes[0][2] - boxes[0][0]
+                    bh_box = boxes[0][3] - boxes[0][1]
+                    mx = int(14 * bw_box / (IMG_SIZE - 14) / 2)
+                    my = int(14 * bh_box / (IMG_SIZE - 14) / 2)
+                    face_pil = pil_full.crop((
+                        max(0, x1 - mx), max(0, y1 - my),
+                        min(W, x2 + mx), min(H, y2 + my)
+                    )).resize((IMG_SIZE, IMG_SIZE), Image.BILINEAR)
+
+        if face_pil is None:
+            face_pil = self._last_good_crop
+            if face_pil is None:
+                crop = min(H, W)
+                t, l = (H - crop) // 2, (W - crop) // 2
+                face_pil = pil_full.crop((l, t, l + crop, t + crop))
+
         if face_found:
-            self._last_good_crop = face_pil  # cache for use on missed-face frames
-        # MTCNN now outputs 224×224 directly; eval_tf's Resize is a no-op but kept
-        # for safety in case image_size is ever changed above.
-        x = eval_tf(face_pil).unsqueeze(0).to(self.device)
-        prob = torch.sigmoid(self.model(x)).item()
+            self._last_good_crop = face_pil
+
+        with torch.no_grad():
+            x = eval_tf(face_pil).unsqueeze(0).to(self.device)
+            prob = torch.sigmoid(self.model(x)).item()
         verdict = "DEEPFAKE" if prob > THRESHOLD else "REAL"
 
-        # ── Debug output ────────────────────────────────────────────────────────
         self._frame_count += 1
         print(
             f"[debug] frame={self._frame_count:05d} "
             f"prob={prob:.4f} verdict={verdict} face_found={face_found}"
         )
-        if self._frame_count % 100 == 0:
-            debug_path = Path(__file__).parent / f"debug_{self._frame_count}.jpg"
-            face_pil.save(debug_path)
-            print(f"[debug] saved face crop → {debug_path}")
-        # ── End debug ────────────────────────────────────────────────────────────
 
         return {
             "prob": prob,
@@ -458,6 +486,46 @@ class Detector:
         fused = np.clip(fused, 0, 1) ** CONTRAST_GAMMA
 
         return fused, prob, verdict
+
+    @staticmethod
+    def _summarize_region_attribution(cam: np.ndarray) -> list:
+        """Rank coarse face regions by their relative share of CAM attention."""
+        height, width = cam.shape
+
+        def values_for(boxes):
+            values = []
+            for x1, y1, x2, y2 in boxes:
+                left, right = int(x1 * width), max(int(x2 * width), 1)
+                top, bottom = int(y1 * height), max(int(y2 * height), 1)
+                values.append(cam[top:bottom, left:right].reshape(-1))
+            return np.concatenate(values)
+
+        regions = {
+            "forehead": [(0.18, 0.05, 0.82, 0.28)],
+            "eye area": [(0.10, 0.25, 0.90, 0.48)],
+            "nose": [(0.32, 0.40, 0.68, 0.68)],
+            "cheek area": [
+                (0.08, 0.45, 0.35, 0.72),
+                (0.65, 0.45, 0.92, 0.72),
+            ],
+            "mouth and jaw": [(0.20, 0.65, 0.80, 0.95)],
+        }
+        mean_attention = {
+            name: float(values_for(boxes).mean())
+            for name, boxes in regions.items()
+        }
+        total_attention = sum(mean_attention.values())
+        if total_attention <= 1e-8:
+            return []
+
+        ranked = sorted(mean_attention.items(), key=lambda item: item[1], reverse=True)
+        return [
+            {
+                "region": name,
+                "attention_pct": round(value / total_attention * 100, 1),
+            }
+            for name, value in ranked[:3]
+        ]
 
     def _compute_score_map(self, face_pil: Image.Image):
         """Remaps the CAM into the real(0)<->fake(1) scale, anchored at 0.5=uncertain.
@@ -709,6 +777,9 @@ class Detector:
             cam, prob, verdict = self._compute_fused_cam(face_pil)
             self._cached_score_map    = cam
             self._cached_heatmap_bbox = bbox
+            self._cached_region_attribution = (
+                self._summarize_region_attribution(cam) if face_found else []
+            )
             # MediaPipe face shape mask — clips heatmap to the actual face oval
             self._cached_face_mask = (
                 self._get_face_shape_mask(frame_rgb, bbox) if bbox is not None else None
@@ -745,6 +816,7 @@ class Detector:
             "face_found": face_found,
             "heatmap_rgba": heatmap_rgba,
             "bbox": bbox,
+            "region_attribution": self._cached_region_attribution,
         }
 
     # ═══════════════════════════════════════════════════════════════════════

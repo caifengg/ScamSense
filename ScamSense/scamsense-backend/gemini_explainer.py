@@ -111,6 +111,7 @@ def _build_deepfake_prompt(
     verdict: str, prob: float, face_found: bool, frames_in_window: int,
     frame_prob: float, max_prob: float, min_prob: float,
     deepfake_frames: int, real_frames: int,
+    region_attribution=None,
 ) -> str:
     avg_pct       = f"{prob * 100:.1f}%"
     frame_pct     = f"{frame_prob * 100:.1f}%"
@@ -121,11 +122,41 @@ def _build_deepfake_prompt(
         if face_found else
         "No face was clearly detected; the analysis used the best available frame region."
     )
+
+    if region_attribution:
+        region_lines = "\n".join(
+            f"- {item['region']}: {item['attention_pct']:.1f}% of measured regional attention"
+            for item in region_attribution
+        )
+        region_context = f"""
+
+Grad-CAM regional attribution for the most recent analysed face:
+{region_lines}
+These are relative shares among coarse face regions. They show where the model
+focused, not the probability that a region was manipulated and not proof of a
+specific visual defect."""
+        region_instruction = (
+            "Include one sentence saying which one or two facial regions the model focused on most. "
+            "Phrase this only as model focus or influence, never as a confirmed defect or the reason a person is fake."
+        )
+    else:
+        # No heatmap/region data was generated for this analysis (e.g. the
+        # feature is switched off). Don't mention attribution being
+        # "unavailable" at all - that reads like an error to the user. The
+        # explanation should simply not talk about facial regions.
+        region_context = ""
+        region_instruction = (
+            "No facial-region/heatmap data was generated for this analysis, so do not mention "
+            "regions, heatmaps, or attribution at all - do not say things like \"no regional "
+            "attribution was available\". Base the explanation only on the overall verdict and "
+            "frame statistics."
+        )
+
     return f"""You are a safety assistant inside a deepfake-detection app called ScamSense, aimed at everyday Singaporean users.
 
 A deepfake detector analysed a live video call. Below are the real statistics from the detector — use only these facts to explain the result. Do NOT invent observations such as "unnatural eyes" or "strange mouth movements".
 
-Detector statistics:
+Detector statistics (for your reasoning only — see output rules below):
 - Overall verdict: {verdict}
 - Frames analysed in current window: {frames_in_window}
 - Frames classified as DEEPFAKE: {deepfake_frames}
@@ -135,17 +166,24 @@ Detector statistics:
 - Lowest single-frame deepfake likelihood: {min_pct}
 - Most recent single frame deepfake likelihood: {frame_pct}
 - {face_line}
+{region_context}
 
-Write 2–3 sentences in plain, non-technical language for a general user that explain the verdict using only the statistics above.
+Write 2–4 sentences in plain, non-technical language for a general user that explain the verdict using only the evidence above.
+{region_instruction}
 If the verdict is DEEPFAKE, give one concrete safety tip (e.g. hang up and verify the caller through a different channel).
 If the verdict is REAL, briefly reassure the user but remind them to stay alert.
-Do not use technical jargon. Do not invent visual observations not supported by the statistics."""
+Do not use technical jargon. Do not invent visual observations not supported by the statistics.
+
+Output rules (important):
+- Do not mention any numbers, percentages, likelihood scores, decimal values, or frame counts anywhere in your response. Do not say things like "0.4%", "2 frames", "extremely low likelihood score", or "with X% confidence". Describe the strength of the result only in plain words (e.g. "strong", "consistent", "no signs of manipulation across the frames we checked") instead of citing figures.
+- Do not mention detection machinery, model internals, or what was or wasn't detected/analysed at a technical level - for example, never say things like "no facial features were detected", "no feature is detected", "no face was found", "the model could not analyse a clear face", or similar. If a face wasn't clearly detected, simply base the explanation on the overall verdict without commenting on that fact at all. The user should never see language about missing detections, missing data, or analysis limitations - only a plain-language explanation of the verdict itself."""
 
 
 def generate_deepfake_explanation(
     verdict: str, prob: float, face_found: bool, frames_in_window: int,
     frame_prob: float = 0.0, max_prob: float = 0.0, min_prob: float = 0.0,
     deepfake_frames: int = 0, real_frames: int = 0,
+    region_attribution=None,
 ) -> str:
     """Return a human-readable explanation string for the current deepfake
     verdict.  Returns an empty string silently if the API is unavailable so
@@ -157,6 +195,7 @@ def generate_deepfake_explanation(
         verdict=verdict, prob=prob, face_found=face_found, frames_in_window=frames_in_window,
         frame_prob=frame_prob, max_prob=max_prob, min_prob=min_prob,
         deepfake_frames=deepfake_frames, real_frames=real_frames,
+        region_attribution=region_attribution,
     )
     payload = {"contents": [{"parts": [{"text": prompt}]}]}
     headers = {"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY}

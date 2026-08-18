@@ -119,18 +119,21 @@ def _get_text_model():
 # ── Deepfake detector (lazy-loaded on first request) ────────────────────────────
 _deepfake_detector = None
 _deepfake_sessions: dict = {}
-_deepfake_reasons: dict = {}  # {session_id: {"verdict": str, "reason": str}}
+_deepfake_reasons: dict = {}
+LIVE_DEEPFAKE_WINDOW = 5
 
 
-def ensure_admin_tables():
+def ensure_admin_tables(db_connection=None, db_cursor=None):
     """
     Ensures optional admin-reporting tables exist. Kept idempotent so it can
     run safely before insert/list operations without a separate migration step.
     """
-    if connection is None or cursor is None:
-        return
+    db_connection = connection if db_connection is None else db_connection
+    db_cursor = cursor if db_cursor is None else db_cursor
+    if db_connection is None or db_cursor is None:
+        return False
 
-    cursor.execute(
+    db_cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS deepfake_checks (
             id INT AUTO_INCREMENT PRIMARY KEY,
@@ -141,7 +144,77 @@ def ensure_admin_tables():
         )
         """
     )
-    connection.commit()
+    db_connection.commit()
+    return True
+
+
+def ensure_text_checks_table(db_connection=None, db_cursor=None):
+    """Create or upgrade the Text Extractor history table."""
+    db_connection = connection if db_connection is None else db_connection
+    db_cursor = cursor if db_cursor is None else db_cursor
+    if db_connection is None or db_cursor is None:
+        return False
+
+    db_cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS text_checks (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            user_id INT NOT NULL,
+            message TEXT NOT NULL,
+            result VARCHAR(100) NOT NULL,
+            confidence FLOAT,
+            flagged BOOLEAN NOT NULL DEFAULT FALSE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        )
+        """
+    )
+    db_cursor.execute("SHOW COLUMNS FROM text_checks LIKE 'flagged'")
+    if db_cursor.fetchone() is None:
+        db_cursor.execute(
+            "ALTER TABLE text_checks ADD COLUMN flagged BOOLEAN NOT NULL DEFAULT FALSE"
+        )
+    db_connection.commit()
+    return True
+
+
+def _save_deepfake_result(session_id, result):
+    """Persist a session verdict without letting a dead DB break detection."""
+    def write_result(db_connection, db_cursor):
+        ensure_admin_tables(db_connection, db_cursor)
+        db_cursor.execute(
+            """
+            INSERT INTO deepfake_checks (session_id, result)
+            VALUES (%s, %s)
+            ON DUPLICATE KEY UPDATE result=VALUES(result), updated_at=CURRENT_TIMESTAMP
+            """,
+            (session_id, result),
+        )
+        db_connection.commit()
+
+    if connection is not None and cursor is not None:
+        try:
+            write_result(connection, cursor)
+            return True
+        except Exception:
+            try:
+                connection.rollback()
+            except Exception:
+                pass
+
+    recovered_connection, recovered_cursor = _ensure_db_connection()
+    if recovered_connection is None or recovered_cursor is None:
+        return False
+
+    try:
+        write_result(recovered_connection, recovered_cursor)
+        return True
+    except Exception:
+        try:
+            recovered_connection.rollback()
+        except Exception:
+            pass
+        return False
 
 
 def _get_deepfake_detector():
@@ -452,9 +525,19 @@ def detect_text():
     # is unavailable, the check still returns normally, it just isn't saved
     # and check_id comes back null - the frontend then simply can't show a
     # flag button or history entry for that particular check.
+    #
+    # Uses the same primary-then-recovery pattern as /signup: try the
+    # module-level connection/cursor first, and if that raises for ANY
+    # reason (including the primary connection having gone stale, which is
+    # what pymysql.err.InterfaceError means), fall back to a fresh
+    # connection from _ensure_db_connection() rather than retrying the
+    # dead one. rollback() on a dead connection also throws, so that's
+    # wrapped in its own try/except too instead of being allowed to mask
+    # the real error.
     check_id = None
     if user_id is not None and connection is not None and cursor is not None:
         try:
+            ensure_text_checks_table(connection, cursor)
             cursor.execute(
                 """
                 INSERT INTO text_checks
@@ -468,7 +551,10 @@ def detect_text():
             connection.commit()
             check_id = cursor.lastrowid
         except Exception:
-            connection.rollback()
+            try:
+                connection.rollback()
+            except Exception:
+                pass
             # Try recovery connection if primary fails
             try:
                 conn, cur = _ensure_db_connection()
@@ -484,8 +570,11 @@ def detect_text():
                     )
                     conn.commit()
                     check_id = cur.lastrowid
-            except:
-                pass
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
 
     return {
         "result": result,
@@ -556,25 +645,57 @@ def list_text_checks():
     if request.method == "OPTIONS":
         return "", 204
 
-    db_error = ensure_db_ready()
-    if db_error:
-        return db_error
+    global _recovered_connection, _recovered_cursor
 
     user_id = request.args.get("user_id")
     if not user_id:
         return {"error": "user_id is required"}, 400
 
-    cursor.execute(
-        """
-        SELECT id, message, result, confidence, flagged, created_at
-        FROM text_checks
-        WHERE user_id=%s
-        ORDER BY created_at DESC
-        LIMIT 50
-        """,
-        (user_id,),
-    )
-    rows = cursor.fetchall()
+    # Use primary connection, fall back to recovery if it's unset or stale
+    # (same pattern as /admin/stats, /admin/text-checks, etc.) - a dead
+    # module-level connection previously caused this whole route to 500
+    # with pymysql.err.InterfaceError instead of recovering.
+    conn = connection
+    cur = cursor
+    if conn is None or cur is None:
+        conn, cur = _ensure_db_connection()
+
+    if conn is None or cur is None:
+        return {"error": "Database unavailable"}, 503
+
+    try:
+        ensure_text_checks_table(conn, cur)
+        cur.execute(
+            """
+            SELECT id, message, result, confidence, flagged, created_at
+            FROM text_checks
+            WHERE user_id=%s
+            ORDER BY created_at DESC
+            LIMIT 50
+            """,
+            (user_id,),
+        )
+        rows = cur.fetchall()
+    except Exception:
+        # Try recovery connection if primary fails
+        conn, cur = _ensure_db_connection()
+        if conn is None or cur is None:
+            return {"error": "Database unavailable"}, 503
+        try:
+            ensure_text_checks_table(conn, cur)
+            cur.execute(
+                """
+                SELECT id, message, result, confidence, flagged, created_at
+                FROM text_checks
+                WHERE user_id=%s
+                ORDER BY created_at DESC
+                LIMIT 50
+                """,
+                (user_id,),
+            )
+            rows = cur.fetchall()
+        except Exception as exc:
+            return {"error": f"Database error: {str(exc)}"}, 500
 
     checks = [
         {
@@ -733,6 +854,7 @@ def admin_text_checks():
     limit = max(1, min(limit, 200))
 
     try:
+        ensure_text_checks_table(conn, cur)
         cur.execute(
             """
             SELECT message, result, confidence, created_at
@@ -760,6 +882,7 @@ def admin_text_checks():
         try:
             conn, cur = _ensure_db_connection()
             if conn and cur:
+                ensure_text_checks_table(conn, cur)
                 cur.execute(
                     """
                     SELECT message, result, confidence, created_at
@@ -911,7 +1034,7 @@ def admin_deepfake_results():
     try:
         cur.execute(
             """
-            SELECT session_id, verdict, created_at
+            SELECT session_id, result, updated_at
             FROM deepfake_checks
             ORDER BY created_at DESC
             LIMIT %s
@@ -937,7 +1060,7 @@ def admin_deepfake_results():
             if conn and cur:
                 cur.execute(
                     """
-                    SELECT session_id, verdict, created_at
+                    SELECT session_id, result, updated_at
                     FROM deepfake_checks
                     ORDER BY created_at DESC
                     LIMIT %s
@@ -992,7 +1115,7 @@ def deepfake_score():
 
     from jing_model import RollingVerdict
     if reset or session_id not in _deepfake_sessions:
-        _deepfake_sessions[session_id] = RollingVerdict(window=25)
+        _deepfake_sessions[session_id] = RollingVerdict(window=LIVE_DEEPFAKE_WINDOW)
 
     rolling = _deepfake_sessions[session_id].update(
         frame_result["prob"], frame_result["face_found"]
@@ -1010,20 +1133,8 @@ def deepfake_score():
     current_verdict = rolling["verdict"]
 
     # Save latest deepfake verdict per session for admin dashboard reporting.
-    if connection is not None and cursor is not None and current_verdict in ("REAL", "DEEPFAKE"):
-        try:
-            ensure_admin_tables()
-            cursor.execute(
-                """
-                INSERT INTO deepfake_checks (session_id, result)
-                VALUES (%s, %s)
-                ON DUPLICATE KEY UPDATE result=VALUES(result), updated_at=CURRENT_TIMESTAMP
-                """,
-                (session_id, current_verdict),
-            )
-            connection.commit()
-        except Exception:
-            connection.rollback()
+    if current_verdict in ("REAL", "DEEPFAKE"):
+        _save_deepfake_result(session_id, current_verdict)
 
     cached = _deepfake_reasons.get(session_id)
     if cached is None or cached["verdict"] != current_verdict:
@@ -1038,7 +1149,11 @@ def deepfake_score():
             deepfake_frames=rolling["deepfake_frames"],
             real_frames=rolling["real_frames"],
         )
-        _deepfake_reasons[session_id] = {"verdict": current_verdict, "reason": reason}
+        _deepfake_reasons[session_id] = {
+            "verdict": current_verdict,
+            "reason": reason,
+            "has_region_attribution": False,
+        }
     else:
         reason = cached["reason"]
     # ── End LLM explanation ───────────────────────────────────────────────────────
@@ -1081,7 +1196,7 @@ def deepfake_heatmap():
 
     from jing_model import RollingVerdict
     if session_id not in _deepfake_sessions:
-        _deepfake_sessions[session_id] = RollingVerdict(window=25)
+        _deepfake_sessions[session_id] = RollingVerdict(window=LIVE_DEEPFAKE_WINDOW)
 
     rolling = _deepfake_sessions[session_id].update(
         result["prob"], result["face_found"]
@@ -1090,23 +1205,21 @@ def deepfake_heatmap():
     current_verdict = rolling["verdict"]
 
     # Save latest deepfake verdict per session for admin dashboard reporting.
-    if connection is not None and cursor is not None and current_verdict in ("REAL", "DEEPFAKE"):
-        try:
-            ensure_admin_tables()
-            cursor.execute(
-                """
-                INSERT INTO deepfake_checks (session_id, result)
-                VALUES (%s, %s)
-                ON DUPLICATE KEY UPDATE result=VALUES(result), updated_at=CURRENT_TIMESTAMP
-                """,
-                (session_id, current_verdict),
-            )
-            connection.commit()
-        except Exception:
-            connection.rollback()
+    if current_verdict in ("REAL", "DEEPFAKE"):
+        _save_deepfake_result(session_id, current_verdict)
 
+    region_attribution = (
+        result.get("region_attribution") or []
+        if result["verdict"] == current_verdict
+        else []
+    )
+    has_region_attribution = bool(region_attribution)
     cached = _deepfake_reasons.get(session_id)
-    if cached is None or cached["verdict"] != current_verdict:
+    if (
+        cached is None
+        or cached["verdict"] != current_verdict
+        or (has_region_attribution and not cached.get("has_region_attribution", False))
+    ):
         reason = generate_deepfake_explanation(
             verdict=current_verdict,
             prob=rolling["prob"],
@@ -1117,8 +1230,13 @@ def deepfake_heatmap():
             min_prob=rolling["min_prob"],
             deepfake_frames=rolling["deepfake_frames"],
             real_frames=rolling["real_frames"],
+            region_attribution=region_attribution,
         )
-        _deepfake_reasons[session_id] = {"verdict": current_verdict, "reason": reason}
+        _deepfake_reasons[session_id] = {
+            "verdict": current_verdict,
+            "reason": reason,
+            "has_region_attribution": has_region_attribution,
+        }
     else:
         reason = cached["reason"]
 
@@ -1151,6 +1269,7 @@ def deepfake_heatmap():
         "reason": reason,
         "heatmap": heatmap_b64,
         "bbox": bbox_norm,
+        "region_attribution": region_attribution,
     }
 
 
@@ -1185,7 +1304,7 @@ def deepfake_stylized_heatmap():
 
     from jing_model import RollingVerdict
     if session_id not in _deepfake_sessions:
-        _deepfake_sessions[session_id] = RollingVerdict(window=25)
+        _deepfake_sessions[session_id] = RollingVerdict(window=LIVE_DEEPFAKE_WINDOW)
 
     prob = result["prob"]
     face_found = result["face_found"]
@@ -1207,7 +1326,11 @@ def deepfake_stylized_heatmap():
                 deepfake_frames=rolling["deepfake_frames"],
                 real_frames=rolling["real_frames"],
             )
-            _deepfake_reasons[session_id] = {"verdict": current_verdict, "reason": reason}
+            _deepfake_reasons[session_id] = {
+                "verdict": current_verdict,
+                "reason": reason,
+                "has_region_attribution": False,
+            }
         else:
             reason = cached["reason"]
     else:
