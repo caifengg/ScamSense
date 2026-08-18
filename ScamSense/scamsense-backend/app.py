@@ -725,32 +725,52 @@ def flag_text_check(check_id):
     if request.method == "OPTIONS":
         return "", 204
 
-    db_error = ensure_db_ready()
-    if db_error:
-        return db_error
-
     data = request.get_json(silent=True) or {}
     user_id = data.get("user_id")
     if not user_id:
         return {"error": "user_id is required"}, 400
 
-    cursor.execute(
-        """
-        UPDATE text_checks
-        SET flagged=TRUE
-        WHERE id=%s AND user_id=%s AND flagged=FALSE
-        """,
-        (check_id, user_id),
-    )
-    connection.commit()
+    def do_flag(db_connection, db_cursor):
+        db_cursor.execute(
+            """
+            UPDATE text_checks
+            SET flagged=TRUE
+            WHERE id=%s AND user_id=%s AND flagged=FALSE
+            """,
+            (check_id, user_id),
+        )
+        db_connection.commit()
+        return db_cursor.rowcount
 
-    if cursor.rowcount == 0:
+    rowcount = None
+    if connection is not None and cursor is not None:
+        try:
+            rowcount = do_flag(connection, cursor)
+        except Exception:
+            try:
+                connection.rollback()
+            except Exception:
+                pass
+
+    if rowcount is None:
+        recovered_connection, recovered_cursor = _ensure_db_connection()
+        if recovered_connection is None or recovered_cursor is None:
+            return {"error": "Database unavailable. Check DB credentials/config."}, 503
+        try:
+            rowcount = do_flag(recovered_connection, recovered_cursor)
+        except Exception as e:
+            try:
+                recovered_connection.rollback()
+            except Exception:
+                pass
+            return {"error": f"Failed to flag check: {e}"}, 500
+
+    if rowcount == 0:
         # Either this check doesn't belong to this user, doesn't exist, or
         # (most commonly) was already flagged once before.
         return {"error": "Check not found, not yours, or already flagged."}, 409
 
     return {"message": "flagged"}
-
 
 @app.route("/text-checks/<int:check_id>", methods=["DELETE", "OPTIONS"])
 def delete_text_check(check_id):
@@ -762,21 +782,42 @@ def delete_text_check(check_id):
     if request.method == "OPTIONS":
         return "", 204
 
-    db_error = ensure_db_ready()
-    if db_error:
-        return db_error
-
     user_id = request.args.get("user_id")
     if not user_id:
         return {"error": "user_id is required"}, 400
 
-    cursor.execute(
-        "DELETE FROM text_checks WHERE id=%s AND user_id=%s",
-        (check_id, user_id),
-    )
-    connection.commit()
+    def do_delete(db_connection, db_cursor):
+        db_cursor.execute(
+            "DELETE FROM text_checks WHERE id=%s AND user_id=%s",
+            (check_id, user_id),
+        )
+        db_connection.commit()
+        return db_cursor.rowcount
 
-    if cursor.rowcount == 0:
+    rowcount = None
+    if connection is not None and cursor is not None:
+        try:
+            rowcount = do_delete(connection, cursor)
+        except Exception:
+            try:
+                connection.rollback()
+            except Exception:
+                pass
+
+    if rowcount is None:
+        recovered_connection, recovered_cursor = _ensure_db_connection()
+        if recovered_connection is None or recovered_cursor is None:
+            return {"error": "Database unavailable. Check DB credentials/config."}, 503
+        try:
+            rowcount = do_delete(recovered_connection, recovered_cursor)
+        except Exception as e:
+            try:
+                recovered_connection.rollback()
+            except Exception:
+                pass
+            return {"error": f"Failed to delete check: {e}"}, 500
+
+    if rowcount == 0:
         return {"error": "Check not found or not yours."}, 404
 
     return {"message": "deleted"}
