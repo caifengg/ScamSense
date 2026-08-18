@@ -797,9 +797,11 @@ def admin_stats():
 
         cursor.execute(
             """
-            SELECT COUNT(*)
-            FROM detections
-            WHERE result='Phishing Website'
+            SELECT
+              (SELECT COUNT(*) FROM detections WHERE result='Phishing Website') +
+              (SELECT COUNT(*) FROM text_checks WHERE result='Scam Message') +
+              (SELECT COUNT(*) FROM deepfake_checks WHERE result='DEEPFAKE')
+            AS total_scams
             """
         )
         total_scams = cursor.fetchone()[0]
@@ -818,9 +820,11 @@ def admin_stats():
 
                 cur.execute(
                     """
-                    SELECT COUNT(*)
-                    FROM detections
-                    WHERE result='Phishing Website'
+                    SELECT
+                      (SELECT COUNT(*) FROM detections WHERE result='Phishing Website') +
+                      (SELECT COUNT(*) FROM text_checks WHERE result='Scam Message') +
+                      (SELECT COUNT(*) FROM deepfake_checks WHERE result='DEEPFAKE')
+                    AS total_scams
                     """
                 )
                 total_scams = cur.fetchone()[0]
