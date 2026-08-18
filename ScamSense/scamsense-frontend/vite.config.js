@@ -19,6 +19,9 @@ export default defineConfig({
       // see list_text_checks()/flag_text_check()/delete_text_check() in app.py.
       '/text-checks': 'http://localhost:5000',
       '/admin/stats': 'http://localhost:5000',
+      '/admin/text-checks': 'http://localhost:5000',
+      '/admin/phishing-detections': 'http://localhost:5000',
+      '/admin/deepfake-results': 'http://localhost:5000',
     },
   },
 })

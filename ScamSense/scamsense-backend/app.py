@@ -1,5 +1,6 @@
 import base64
 import io
+import os
 
 import cv2
 import numpy as np
@@ -10,6 +11,55 @@ from pathlib import Path
 from PIL import Image as PILImage
 
 from database import DB_CONNECTION_ERROR, connection, cursor
+
+# ── Database connection recovery ──────────────────────────────────────────────
+# Handles reconnection if the main connection times out
+_recovered_connection = None
+_recovered_cursor = None
+
+def _ensure_db_connection():
+    """Reconnect to database if the connection is lost or None."""
+    global _recovered_connection, _recovered_cursor
+    
+    if _recovered_connection is not None:
+        try:
+            _recovered_connection.ping()
+            return _recovered_connection, _recovered_cursor
+        except:
+            pass
+    
+    # Try to establish a new connection
+    db_host = os.getenv("DB_HOST", "localhost")
+    db_user = os.getenv("DB_USER", "scamsense")
+    db_name = os.getenv("DB_NAME", "scamsense")
+    env_password = os.getenv("DB_PASSWORD")
+    
+    password_candidates = []
+    if env_password is not None:
+        password_candidates.append(env_password)
+    password_candidates.extend(["scamsense123", "scamsense"])
+    
+    seen = set()
+    unique_password_candidates = []
+    for candidate in password_candidates:
+        if candidate not in seen:
+            seen.add(candidate)
+            unique_password_candidates.append(candidate)
+    
+    for candidate in unique_password_candidates:
+        try:
+            _recovered_connection = pymysql.connect(
+                host=db_host,
+                user=db_user,
+                password=candidate,
+                database=db_name,
+            )
+            _recovered_cursor = _recovered_connection.cursor()
+            return _recovered_connection, _recovered_cursor
+        except:
+            pass
+    
+    return None, None
 from feature_extractor import extract_features
 # preprocess_text uses scam_detector.ipynb's Section 3.2 cleaning
 # (lowercase, URL/phone/money tokenising, stopword removal, lemmatization)
@@ -70,6 +120,28 @@ def _get_text_model():
 _deepfake_detector = None
 _deepfake_sessions: dict = {}
 _deepfake_reasons: dict = {}  # {session_id: {"verdict": str, "reason": str}}
+
+
+def ensure_admin_tables():
+    """
+    Ensures optional admin-reporting tables exist. Kept idempotent so it can
+    run safely before insert/list operations without a separate migration step.
+    """
+    if connection is None or cursor is None:
+        return
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS deepfake_checks (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            session_id VARCHAR(120) NOT NULL UNIQUE,
+            result VARCHAR(20) NOT NULL,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    connection.commit()
 
 
 def _get_deepfake_detector():
@@ -136,10 +208,39 @@ def signup():
         connection.commit()
         return {"message": "success"}
     except pymysql.err.IntegrityError:
-        connection.rollback()
+        try:
+            connection.rollback()
+        except:
+            pass
         return {"error": "Email already exists."}, 409
     except Exception as exc:
-        connection.rollback()
+        try:
+            connection.rollback()
+        except:
+            pass
+        # Try recovery connection if primary fails
+        try:
+            conn, cur = _ensure_db_connection()
+            if conn and cur:
+                cur.execute(
+                    """
+                    INSERT INTO users
+                    (username,email,password,role)
+                    VALUES
+                    (%s,%s,%s,%s)
+                    """,
+                    (username, email, password, role),
+                )
+                conn.commit()
+                return {"message": "success"}
+        except pymysql.err.IntegrityError:
+            try:
+                conn.rollback()
+            except:
+                pass
+            return {"error": "Email already exists."}, 409
+        except:
+            pass
         return {"error": f"Signup failed: {str(exc)}"}, 500
 
 
@@ -157,28 +258,56 @@ def login():
     email = data["email"]
     password = data["password"]
 
-    cursor.execute(
-        """
-        SELECT *
-        FROM users
-        WHERE email=%s
-        AND password=%s
-        """,
-        (email, password),
-    )
+    try:
+        cursor.execute(
+            """
+            SELECT *
+            FROM users
+            WHERE email=%s
+            AND password=%s
+            """,
+            (email, password),
+        )
 
-    user = cursor.fetchone()
+        user = cursor.fetchone()
 
-    if user:
+        if user:
+            return {
+                "success": True,
+                "role": user[4],
+                "user_id": user[0],
+            }
+
         return {
-            "success": True,
-            "role": user[4],
-            "user_id": user[0],
+            "success": False,
         }
-
-    return {
-        "success": False,
-    }
+    except Exception as exc:
+        # Try recovery connection if primary fails
+        try:
+            conn, cur = _ensure_db_connection()
+            if conn and cur:
+                cur.execute(
+                    """
+                    SELECT *
+                    FROM users
+                    WHERE email=%s
+                    AND password=%s
+                    """,
+                    (email, password),
+                )
+                user = cur.fetchone()
+                if user:
+                    return {
+                        "success": True,
+                        "role": user[4],
+                        "user_id": user[0],
+                    }
+                return {
+                    "success": False,
+                }
+        except:
+            pass
+        return {"error": f"Database error: {str(exc)}"}, 500
 
 
 @app.route("/detect", methods=["POST", "OPTIONS"])
@@ -206,17 +335,35 @@ def detect():
     else:
         result = "Phishing Website"
 
-    cursor.execute(
-        """
-        INSERT INTO detections
-        (url,result)
+    try:
+        cursor.execute(
+            """
+            INSERT INTO detections
+            (url,result)
 
-        VALUES
-        (%s,%s)
-        """,
-        (url, result),
-    )
-    connection.commit()
+            VALUES
+            (%s,%s)
+            """,
+            (url, result),
+        )
+        connection.commit()
+    except Exception as exc:
+        # Try recovery connection if primary fails
+        try:
+            conn, cur = _ensure_db_connection()
+            if conn and cur:
+                cur.execute(
+                    """
+                    INSERT INTO detections
+                    (url,result)
+                    VALUES
+                    (%s,%s)
+                    """,
+                    (url, result),
+                )
+                conn.commit()
+        except:
+            pass
 
     explanation_result = generate_explanation(url, result, confidence)
 
@@ -322,6 +469,23 @@ def detect_text():
             check_id = cursor.lastrowid
         except Exception:
             connection.rollback()
+            # Try recovery connection if primary fails
+            try:
+                conn, cur = _ensure_db_connection()
+                if conn and cur:
+                    cur.execute(
+                        """
+                        INSERT INTO text_checks
+                        (user_id, message, result, confidence)
+                        VALUES
+                        (%s, %s, %s, %s)
+                        """,
+                        (user_id, message, result, confidence),
+                    )
+                    conn.commit()
+                    check_id = cur.lastrowid
+            except:
+                pass
 
     return {
         "result": result,
@@ -506,22 +670,293 @@ def admin_stats():
     if db_error:
         return db_error
 
-    cursor.execute("SELECT COUNT(*) FROM users")
-    total_users = cursor.fetchone()[0]
+    try:
+        cursor.execute("SELECT COUNT(*) FROM users")
+        total_users = cursor.fetchone()[0]
 
-    cursor.execute(
-        """
-        SELECT COUNT(*)
-        FROM detections
-        WHERE result='Phishing Website'
-        """
-    )
-    total_scams = cursor.fetchone()[0]
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM detections
+            WHERE result='Phishing Website'
+            """
+        )
+        total_scams = cursor.fetchone()[0]
 
-    return {
-        "total_users": total_users,
-        "total_scams": total_scams,
-    }
+        return {
+            "total_users": total_users,
+            "total_scams": total_scams,
+        }
+    except Exception as exc:
+        # Try recovery connection if primary fails
+        try:
+            conn, cur = _ensure_db_connection()
+            if conn and cur:
+                cur.execute("SELECT COUNT(*) FROM users")
+                total_users = cur.fetchone()[0]
+
+                cur.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM detections
+                    WHERE result='Phishing Website'
+                    """
+                )
+                total_scams = cur.fetchone()[0]
+
+                return {
+                    "total_users": total_users,
+                    "total_scams": total_scams,
+                }
+        except:
+            pass
+        return {"error": f"Database error: {str(exc)}"}, 500
+
+
+@app.route("/admin/text-checks", methods=["GET", "OPTIONS"])
+def admin_text_checks():
+    if request.method == "OPTIONS":
+        return "", 204
+
+    global _recovered_connection, _recovered_cursor
+    
+    # Use primary connection, fall back to recovery if needed
+    conn = connection
+    cur = cursor
+    if connection is None or cursor is None:
+        conn, cur = _ensure_db_connection()
+    
+    if conn is None or cur is None:
+        return {"error": "Database unavailable"}, 503
+
+    limit = int(request.args.get("limit", 50))
+    limit = max(1, min(limit, 200))
+
+    try:
+        cur.execute(
+            """
+            SELECT message, result, confidence, created_at
+            FROM text_checks
+            ORDER BY created_at DESC
+            LIMIT %s
+            """,
+            (limit,),
+        )
+        rows = cur.fetchall()
+
+        checks = [
+            {
+                "message": row[0],
+                "result": row[1],
+                "confidence": row[2],
+                "created_at": row[3].isoformat() if row[3] else None,
+            }
+            for row in rows
+        ]
+
+        return {"checks": checks}
+    except Exception as exc:
+        # Try recovery connection if primary fails
+        try:
+            conn, cur = _ensure_db_connection()
+            if conn and cur:
+                cur.execute(
+                    """
+                    SELECT message, result, confidence, created_at
+                    FROM text_checks
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                    """,
+                    (limit,),
+                )
+                rows = cur.fetchall()
+                checks = [
+                    {
+                        "message": row[0],
+                        "result": row[1],
+                        "confidence": row[2],
+                        "created_at": row[3].isoformat() if row[3] else None,
+                    }
+                    for row in rows
+                ]
+                return {"checks": checks}
+        except:
+            pass
+        return {"error": f"Database error: {str(exc)}"}, 500
+
+
+@app.route("/admin/phishing-detections", methods=["GET", "OPTIONS"])
+def admin_phishing_detections():
+    if request.method == "OPTIONS":
+        return "", 204
+
+    global _recovered_connection, _recovered_cursor
+    
+    # Use primary connection, fall back to recovery if needed
+    conn = connection
+    cur = cursor
+    if connection is None or cursor is None:
+        conn, cur = _ensure_db_connection()
+    
+    if conn is None or cur is None:
+        return {"error": "Database unavailable"}, 503
+
+    limit = int(request.args.get("limit", 50))
+    limit = max(1, min(limit, 200))
+
+    try:
+        cur.execute(
+            """
+            SELECT url, result, created_at
+            FROM detections
+            ORDER BY created_at DESC
+            LIMIT %s
+            """,
+            (limit,),
+        )
+        rows = cur.fetchall()
+
+        detections = [
+            {
+                "url": row[0],
+                "result": row[1],
+                "created_at": row[2].isoformat() if row[2] else None,
+            }
+            for row in rows
+        ]
+
+        return {"detections": detections}
+    except Exception as exc:
+        # Try recovery connection if primary fails
+        try:
+            conn, cur = _ensure_db_connection()
+            if conn and cur:
+                cur.execute(
+                    """
+                    SELECT url, result, created_at
+                    FROM detections
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                    """,
+                    (limit,),
+                )
+                rows = cur.fetchall()
+                detections = [
+                    {
+                        "url": row[0],
+                        "result": row[1],
+                        "created_at": row[2].isoformat() if row[2] else None,
+                    }
+                    for row in rows
+                ]
+                return {"detections": detections}
+        except:
+            pass
+        return {"error": f"Database error: {str(exc)}"}, 500
+
+
+@app.route("/admin/deepfake-results", methods=["GET", "OPTIONS"])
+def admin_deepfake_results():
+    if request.method == "OPTIONS":
+        return "", 204
+
+    global _recovered_connection, _recovered_cursor
+    
+    # Use primary connection, fall back to recovery if needed
+    conn = connection
+    cur = cursor
+    if connection is None or cursor is None:
+        conn, cur = _ensure_db_connection()
+    
+    if conn is None or cur is None:
+        return {"error": "Database unavailable"}, 503
+
+    # Ensure admin tables exist
+    try:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS deepfake_checks (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                session_id VARCHAR(120) NOT NULL UNIQUE,
+                result VARCHAR(20) NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.commit()
+    except Exception as table_exc:
+        # Try recovery connection if table creation fails
+        try:
+            conn, cur = _ensure_db_connection()
+            if conn and cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS deepfake_checks (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+                        session_id VARCHAR(120) NOT NULL UNIQUE,
+                        result VARCHAR(20) NOT NULL,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                    """
+                )
+                conn.commit()
+        except:
+            pass
+
+    limit = int(request.args.get("limit", 50))
+    limit = max(1, min(limit, 200))
+
+    try:
+        cur.execute(
+            """
+            SELECT session_id, verdict, created_at
+            FROM deepfake_checks
+            ORDER BY created_at DESC
+            LIMIT %s
+            """,
+            (limit,),
+        )
+        rows = cur.fetchall()
+
+        checks = [
+            {
+                "session_id": row[0],
+                "result": row[1],
+                "updated_at": row[2].isoformat() if row[2] else None,
+            }
+            for row in rows
+        ]
+
+        return {"checks": checks}
+    except Exception as exc:
+        # Try recovery connection if primary fails
+        try:
+            conn, cur = _ensure_db_connection()
+            if conn and cur:
+                cur.execute(
+                    """
+                    SELECT session_id, verdict, created_at
+                    FROM deepfake_checks
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                    """,
+                    (limit,),
+                )
+                rows = cur.fetchall()
+                checks = [
+                    {
+                        "session_id": row[0],
+                        "result": row[1],
+                        "updated_at": row[2].isoformat() if row[2] else None,
+                    }
+                    for row in rows
+                ]
+                return {"checks": checks}
+        except:
+            pass
+        return {"error": f"Database error: {str(exc)}"}, 500
 
 
 @app.route("/deepfake/score", methods=["POST", "OPTIONS"])
@@ -573,6 +1008,23 @@ def deepfake_score():
 
     # ── LLM explanation (generated only when the verdict changes) ────────────────
     current_verdict = rolling["verdict"]
+
+    # Save latest deepfake verdict per session for admin dashboard reporting.
+    if connection is not None and cursor is not None and current_verdict in ("REAL", "DEEPFAKE"):
+        try:
+            ensure_admin_tables()
+            cursor.execute(
+                """
+                INSERT INTO deepfake_checks (session_id, result)
+                VALUES (%s, %s)
+                ON DUPLICATE KEY UPDATE result=VALUES(result), updated_at=CURRENT_TIMESTAMP
+                """,
+                (session_id, current_verdict),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+
     cached = _deepfake_reasons.get(session_id)
     if cached is None or cached["verdict"] != current_verdict:
         reason = generate_deepfake_explanation(
@@ -636,6 +1088,23 @@ def deepfake_heatmap():
     )
 
     current_verdict = rolling["verdict"]
+
+    # Save latest deepfake verdict per session for admin dashboard reporting.
+    if connection is not None and cursor is not None and current_verdict in ("REAL", "DEEPFAKE"):
+        try:
+            ensure_admin_tables()
+            cursor.execute(
+                """
+                INSERT INTO deepfake_checks (session_id, result)
+                VALUES (%s, %s)
+                ON DUPLICATE KEY UPDATE result=VALUES(result), updated_at=CURRENT_TIMESTAMP
+                """,
+                (session_id, current_verdict),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+
     cached = _deepfake_reasons.get(session_id)
     if cached is None or cached["verdict"] != current_verdict:
         reason = generate_deepfake_explanation(
